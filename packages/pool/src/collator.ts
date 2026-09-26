@@ -28,71 +28,74 @@ export class Collator implements Contracts.Pool.Collator {
         exclude: string[],
     ): Promise<Interfaces.ITransaction[]> {
         const height: number = this.blockchain.getLastBlock().data.height;
-        const milestone = Managers.configManager.getMilestone(height);
-        const blockHeaderSize =
-            4 + // version
-            4 + // timestamp
-            4 + // height
-            32 + // previousBlockId
-            4 + // numberOfTransactions
-            8 + // totalAmount
-            8 + // totalFee
-            8 + // reward
-            4 + // payloadLength
-            32 + // payloadHash
-            33; // generatorPublicKey
+        // Candidates are validated by the rules of the next block, tip + 1; the block budget stays at the tip
+        return Managers.configManager.runAtHeight(height + 1, async () => {
+            const milestone = Managers.configManager.getMilestone(height);
+            const blockHeaderSize =
+                4 + // version
+                4 + // timestamp
+                4 + // height
+                32 + // previousBlockId
+                4 + // numberOfTransactions
+                8 + // totalAmount
+                8 + // totalFee
+                8 + // reward
+                4 + // payloadLength
+                32 + // payloadHash
+                33; // generatorPublicKey
 
-        let bytesLeft: number = milestone.block.maxPayload - blockHeaderSize;
+            let bytesLeft: number = milestone.block.maxPayload - blockHeaderSize;
 
-        const candidateTransactions: Interfaces.ITransaction[] = [];
-        const validator: Contracts.State.TransactionValidator = this.createTransactionValidator();
-        const failedTransactions: Interfaces.ITransaction[] = [];
+            const candidateTransactions: Interfaces.ITransaction[] = [];
+            const validator: Contracts.State.TransactionValidator = this.createTransactionValidator();
+            const failedTransactions: Interfaces.ITransaction[] = [];
 
-        const transactions: Interfaces.ITransaction[] = Array.from(this.poolQuery.getFromHighestPriority()).filter(
-            (t) => !exclude.includes(t.id!),
-        );
+            const transactions: Interfaces.ITransaction[] = Array.from(this.poolQuery.getFromHighestPriority()).filter(
+                (t) => !exclude.includes(t.id!),
+            );
 
-        for (const transaction of transactions) {
-            if (candidateTransactions.length === milestone.block.maxTransactions) {
-                break;
-            }
-
-            if (failedTransactions.some((t) => t.data.senderId === transaction.data.senderId)) {
-                continue;
-            }
-
-            try {
-                if (this.expirationService.isExpired(transaction)) {
-                    const expirationHeight: number = this.expirationService.getExpirationHeight(transaction);
-                    throw new TransactionHasExpiredError(transaction, expirationHeight);
-                }
-
-                if (bytesLeft - 4 - transaction.serialised.length < 0) {
+            for (const transaction of transactions) {
+                if (candidateTransactions.length === milestone.block.maxTransactions) {
                     break;
                 }
 
-                let candidateTransaction: Interfaces.ITransaction;
-                if (validate) {
-                    candidateTransaction = await validator.validate(transaction);
-                } else {
-                    candidateTransaction = transaction;
+                if (failedTransactions.some((t) => t.data.senderId === transaction.data.senderId)) {
+                    continue;
                 }
-                candidateTransactions.push(candidateTransaction);
 
-                bytesLeft -= 4;
-                bytesLeft -= candidateTransaction.serialised.length;
-            } catch (error) {
-                this.logger.warning(`${transaction} failed to collate: ${error.message} :warning:`);
-                failedTransactions.push(transaction);
+                try {
+                    if (this.expirationService.isExpired(transaction)) {
+                        const expirationHeight: number = this.expirationService.getExpirationHeight(transaction);
+                        throw new TransactionHasExpiredError(transaction, expirationHeight);
+                    }
+
+                    if (bytesLeft - 4 - transaction.serialised.length < 0) {
+                        break;
+                    }
+
+                    let candidateTransaction: Interfaces.ITransaction;
+                    if (validate) {
+                        candidateTransaction = await validator.validate(transaction);
+                    } else {
+                        candidateTransaction = transaction;
+                    }
+                    candidateTransactions.push(candidateTransaction);
+
+                    bytesLeft -= 4;
+                    bytesLeft -= candidateTransaction.serialised.length;
+                } catch (error) {
+                    this.logger.warning(`${transaction} failed to collate: ${error.message} :warning:`);
+                    failedTransactions.push(transaction);
+                }
             }
-        }
 
-        (async () => {
-            for (const failedTransaction of failedTransactions) {
-                await this.pool.removeTransaction(failedTransaction);
-            }
-        })();
+            (async () => {
+                for (const failedTransaction of failedTransactions) {
+                    await this.pool.removeTransaction(failedTransaction);
+                }
+            })();
 
-        return candidateTransactions;
+            return candidateTransactions;
+        });
     }
 }
