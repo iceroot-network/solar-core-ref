@@ -215,6 +215,9 @@ async function bootstrapTransfers(transactions) {
     const repository = new StubWalletRepository();
     const handler = Object.create(Handlers.Core.TransferTransactionHandler.prototype);
     handler.walletRepository = repository;
+    // Since patch 49 the handler takes the generator key from the StateStore's genesis block.
+    const generatorPublicKey = Managers.configManager.get("genesisBlock.generatorPublicKey");
+    handler.app = { get: () => ({ getGenesisBlock: () => ({ data: { generatorPublicKey } }) }) };
     handler.transactionHistoryService = {
         async *streamByCriteria(criteria) {
             for (const transaction of transactions) {

@@ -57,6 +57,14 @@ export class DatabaseInteraction {
             if (genesisErrors.length === 0) {
                 genesisErrors.push(...(await this.verifyGenesisBlock(genesisBlock)));
             }
+            if (genesisErrors.length === 0) {
+                try {
+                    // It computes the issued amount and refuses one over 2^63 - 1
+                    this.stateStore.setGenesisBlock(genesisBlock!);
+                } catch (error) {
+                    genesisErrors.push(error.message);
+                }
+            }
             if (genesisErrors.length > 0) {
                 this.logger.error(`Invalid genesis block: ${genesisErrors.join("; ")}`);
                 try {
@@ -65,8 +73,6 @@ export class DatabaseInteraction {
                     process.exit(1);
                 }
             }
-
-            this.stateStore.setGenesisBlock(genesisBlock!);
 
             if (process.env.CORE_RESET_DATABASE) {
                 await this.reset();
