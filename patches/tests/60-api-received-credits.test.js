@@ -1,0 +1,236 @@
+#!/usr/bin/env node
+// Patch 60 api-received-credits (L-150; consensus: no).
+//
+// Rule: the recipientId search, and so /wallets/{id}/transactions/received, matches only
+// transactions that credit the address: a top-level recipientId, or a Core/6 transfer with an
+// item paid to it. It no longer matches delegate registrations sent by the address. The broader
+// address filter is or(senderId, recipientId), so it still finds a wallet's own registration
+// through its senderId clause.
+//
+// Usage: SOLAR_DIR=<built Solar checkout> node patches/tests/60-api-received-credits.test.js
+// SOLAR_DIR defaults to the repository root two levels up. Exit code 0 only if every check passes.
+//
+// The filter and the controller are created with Object.create and given stub dependencies, so
+// no node, database or configuration is needed. Expected expression trees are literals below.
+
+"use strict";
+
+const path = require("path");
+const util = require("util");
+
+const SOLAR_DIR = path.resolve(process.env.SOLAR_DIR || path.join(__dirname, "..", ".."));
+
+// Devnet addresses (network byte 90), from Identities.Address.fromPassphrase(<passphrase>, 90):
+// "s1 patch 60 known wallet" and "s1 patch 60 unknown wallet". The filter treats them as opaque
+// strings; only KNOWN is in the stub wallet repository.
+const KNOWN = "dVC4JTxrX5khfrmK6xoZUxTdMoRpk7SLuF";
+const UNKNOWN = "dRqKhvEfj3EyynduDjuFQ6fucLNDUzDbvg";
+
+// Transaction type numbers at b45369d7 (crypto/src/enums.ts).
+const CORE = 1; // TransactionTypeGroup.Core
+const TRANSFER = 6; // TransactionType.Core.Transfer
+const DELEGATE_REGISTRATION = 2; // TransactionType.Core.DelegateRegistration
+
+const recipientIdClause = (a) => ({ op: "equal", property: "recipientId", value: a });
+const senderIdClause = (a) => ({ op: "equal", property: "senderId", value: a });
+const transferItemClause = (a) => ({
+    op: "and",
+    expressions: [
+        { op: "equal", property: "typeGroup", value: CORE },
+        { op: "equal", property: "type", value: TRANSFER },
+        { op: "contains", property: "asset", value: { transfers: [{ recipientId: a }] } },
+    ],
+});
+
+// Expected trees after optimiseExpression, with the patch.
+const EXPECTED = {
+    recipientKnown: { op: "or", expressions: [recipientIdClause(KNOWN), transferItemClause(KNOWN)] },
+    recipientUnknown: { op: "or", expressions: [recipientIdClause(UNKNOWN), transferItemClause(UNKNOWN)] },
+    addressKnown: {
+        op: "or",
+        expressions: [senderIdClause(KNOWN), recipientIdClause(KNOWN), transferItemClause(KNOWN)],
+    },
+    // An unknown sender gives op "false", which the optimiser drops from the "or".
+    addressUnknown: { op: "or", expressions: [recipientIdClause(UNKNOWN), transferItemClause(UNKNOWN)] },
+};
+
+let passed = 0;
+let failed = 0;
+
+const pass = (name) => {
+    passed++;
+    console.log(`PASS ${name}`);
+};
+
+const fail = (name, detail) => {
+    failed++;
+    console.log(`FAIL ${name}: ${detail}`);
+};
+
+const check = async (name, fn) => {
+    try {
+        const problem = await fn();
+        if (problem) {
+            fail(name, problem);
+        } else {
+            pass(name);
+        }
+    } catch (error) {
+        fail(name, `threw ${error && error.stack ? error.stack.split("\n")[0] : error}`);
+    }
+};
+
+const show = (value) => JSON.stringify(value);
+
+const differs = (actual, expected) =>
+    util.isDeepStrictEqual(actual, expected) ? undefined : `got ${show(actual)}, expected ${show(expected)}`;
+
+// Every sub-expression that matches delegate registrations (typeGroup Core and type 2).
+const registrationClauses = (expression) => {
+    const found = [];
+    const visit = (e) => {
+        if (!e || typeof e !== "object") {
+            return;
+        }
+        if (e.op === "and" && Array.isArray(e.expressions)) {
+            const hasType = e.expressions.some(
+                (x) => x.op === "equal" && x.property === "type" && x.value === DELEGATE_REGISTRATION,
+            );
+            const hasGroup = e.expressions.some(
+                (x) => x.op === "equal" && x.property === "typeGroup" && x.value === CORE,
+            );
+            if (hasType && hasGroup) {
+                found.push(e);
+            }
+        }
+        if (Array.isArray(e.expressions)) {
+            e.expressions.forEach(visit);
+        }
+    };
+    visit(expression);
+    return found;
+};
+
+const noRegistrationClause = (expression) => {
+    const found = registrationClauses(expression);
+    return found.length === 0 ? undefined : `delegate-registration clause present: ${show(found)}`;
+};
+
+const hasClause = (expression, clause) => {
+    let seen = false;
+    const visit = (e) => {
+        if (util.isDeepStrictEqual(e, clause)) {
+            seen = true;
+        }
+        if (e && Array.isArray(e.expressions)) {
+            e.expressions.forEach(visit);
+        }
+    };
+    visit(expression);
+    return seen;
+};
+
+// Stub wallet repository: knows KNOWN only, as the state wallet repository would after KNOWN
+// has appeared on chain.
+const walletRepositoryStub = () => ({
+    hasByAddress: (address) => address === KNOWN,
+    findByAddress: (address) => {
+        if (address !== KNOWN) {
+            throw new Error(`stub wallet repository: unknown address ${address}`);
+        }
+        return { getAddress: () => address };
+    },
+});
+
+const load = (name, relative) => {
+    try {
+        return require(path.join(SOLAR_DIR, relative));
+    } catch (error) {
+        fail(`load ${name}`, `${relative} from ${SOLAR_DIR}: ${error.message.split("\n")[0]}`);
+        return undefined;
+    }
+};
+
+const main = async () => {
+    console.log(`SOLAR_DIR=${SOLAR_DIR}`);
+
+    const filterModule = load("TransactionFilter", "packages/database/dist/transaction-filter");
+    const historyModule = load("TransactionHistoryService", "packages/database/dist/transaction-history-service");
+    const walletsModule = load("WalletsController", "packages/api/dist/controllers/wallets");
+
+    if (filterModule) {
+        const { TransactionFilter } = filterModule;
+        const filter = Object.create(TransactionFilter.prototype);
+        filter.walletRepository = walletRepositoryStub();
+
+        // The rule itself: "received" does not match the address's own delegate registration.
+        await check("recipientId of a known wallet has no delegate-registration clause", async () =>
+            noRegistrationClause(await filter.getExpression({ recipientId: KNOWN })),
+        );
+        await check("recipientId of a known wallet is recipientId or a transfer item", async () =>
+            differs(await filter.getExpression({ recipientId: KNOWN }), EXPECTED.recipientKnown),
+        );
+
+        // Unchanged by the patch: an address with no wallet never had the registration branch.
+        await check("recipientId of an unknown wallet is unchanged", async () =>
+            differs(await filter.getExpression({ recipientId: UNKNOWN }), EXPECTED.recipientUnknown),
+        );
+
+        // The address filter still finds the wallet's own registration through senderId.
+        await check("address of a known wallet keeps the senderId clause", async () => {
+            const expression = await filter.getExpression({ address: KNOWN });
+            return hasClause(expression, senderIdClause(KNOWN))
+                ? undefined
+                : `no ${show(senderIdClause(KNOWN))} in ${show(expression)}`;
+        });
+        await check("address of a known wallet is senderId, recipientId or a transfer item", async () =>
+            differs(await filter.getExpression({ address: KNOWN }), EXPECTED.addressKnown),
+        );
+        await check("address of an unknown wallet is unchanged", async () =>
+            differs(await filter.getExpression({ address: UNKNOWN }), EXPECTED.addressUnknown),
+        );
+
+        // /wallets/{id}/transactions/received, through the real controller, history service and
+        // filter. Only the repositories, the wallet search and the listing helpers are stubbed.
+        if (historyModule && walletsModule) {
+            await check("/wallets/{id}/transactions/received uses the credits-only expression", async () => {
+                const seen = [];
+
+                const history = Object.create(historyModule.TransactionHistoryService.prototype);
+                history.transactionFilter = filter;
+                history.transactionRepository = {
+                    listByExpression: async (expression) => {
+                        seen.push(expression);
+                        return { results: [], totalCount: 0, meta: { totalCountIsEstimate: false } };
+                    },
+                };
+                history.modelConverter = { getTransactionData: (models) => models };
+
+                const controller = Object.create(walletsModule.WalletsController.prototype);
+                controller.walletSearchService = {
+                    getWallet: (id) => (id === KNOWN ? { address: KNOWN } : undefined),
+                };
+                controller.transactionHistoryService = history;
+                controller.getListingOrder = () => [{ property: "blockHeight", direction: "desc" }];
+                controller.getListingPage = () => ({ offset: 0, limit: 100 });
+                controller.getListingOptions = () => ({ estimateTotalCount: true });
+
+                await controller.transactionsReceived({ params: { id: KNOWN }, query: {} }, {});
+
+                if (seen.length !== 1) {
+                    return `expected one repository query, saw ${seen.length}`;
+                }
+                return noRegistrationClause(seen[0]) || differs(seen[0], EXPECTED.recipientKnown);
+            });
+        }
+    }
+
+    console.log(`${failed === 0 ? "OK" : "FAILED"} 60-api-received-credits: ${passed} passed, ${failed} failed`);
+    process.exitCode = failed === 0 ? 0 : 1;
+};
+
+main().catch((error) => {
+    console.log(`FAIL unexpected error: ${error && error.stack ? error.stack : error}`);
+    console.log("FAILED 60-api-received-credits");
+    process.exitCode = 1;
+});
