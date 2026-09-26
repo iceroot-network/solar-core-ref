@@ -1,6 +1,5 @@
 import { Hash, HashAlgorithms } from "../crypto";
 import { IBlock, IBlockData, IBlockJson, IKeyPair, ITransaction } from "../interfaces";
-import { configManager } from "../managers";
 import { BigNumber } from "../utils";
 import { Block } from "./block";
 import { Deserialiser } from "./deserialiser";
@@ -8,14 +7,13 @@ import { Serialiser } from "./serialiser";
 
 export class BlockFactory {
     public static make(data: IBlockData, keys: IKeyPair, aux?: Buffer): IBlock {
-        const { bip340 } = configManager.getMilestone(data.height);
-
         data.generatorPublicKey = keys.publicKey.secp256k1;
 
         const payloadHash: Buffer = Serialiser.serialise(data, false);
         const hash: Buffer = HashAlgorithms.sha256(payloadHash);
 
-        data.blockSignature = Hash.signSchnorr(hash, keys, bip340, aux);
+        // Blocks are always signed with BIP340, whatever the milestone's bip340 says (L-43, L-57)
+        data.blockSignature = Hash.signSchnorr(hash, keys, true, aux);
         data.id = Block.getId(data);
 
         return this.fromData(data)!;

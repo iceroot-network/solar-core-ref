@@ -95,9 +95,8 @@ export const numberToHex = (num: number, padding = 2): string => {
 };
 
 export const isSupportedTransactionVersion = (version: number): boolean => {
-    const { acceptLegacySchnorrTransactions, bip340 } = configManager.getMilestone();
-
-    return version === 3 || (version === 2 && (acceptLegacySchnorrTransactions || !bip340));
+    // Only version 3 (BIP340) is supported, whatever acceptLegacySchnorrTransactions and bip340 say (L-43, L-57)
+    return version === 3;
 };
 
 export const calculateDonations = (height: number, reward: BigNumber): Record<string, BigNumber> => {
