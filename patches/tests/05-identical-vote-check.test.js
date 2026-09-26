@@ -1,0 +1,203 @@
+#!/usr/bin/env node
+// Patch 05 identical-vote-check (L-97 item 4).
+// VoteTransactionHandler.throwIfCannotBeApplied compares the new votes with the wallet's votes
+// as plain objects (Object.fromEntries of the wallet's votes Map), so the check fires in any
+// key order: equal and empty raises NoVoteError, equal and non-empty raises
+// AlreadyVotedForSameDelegatesError. Solar 4.3.1 compared a plain object with a Map, which is
+// never equal. The check keeps its place: after the too-many-delegates check, before the
+// unknown-delegate check.
+//
+// Usage: SOLAR_DIR=<built Solar checkout> node patches/tests/05-identical-vote-check.test.js
+// Exit code 0 when every check passes, 1 otherwise.
+"use strict";
+
+const path = require("path");
+
+const SOLAR_DIR = process.env.SOLAR_DIR || path.resolve(__dirname, "../..");
+
+let failed = 0;
+let passed = 0;
+const pass = (name) => {
+    passed++;
+    console.log(`PASS ${name}`);
+};
+const fail = (name, detail) => {
+    failed++;
+    console.log(`FAIL ${name}: ${detail}`);
+};
+const check = async (name, fn) => {
+    try {
+        const detail = await fn();
+        if (detail === true) {
+            pass(name);
+        } else {
+            fail(name, detail);
+        }
+    } catch (error) {
+        fail(
+            name,
+            `threw ${error && error.constructor ? error.constructor.name : typeof error}: ${error && error.message}`,
+        );
+    }
+};
+
+const devnetConfig = () => ({
+    network: {
+        name: "devnet",
+        messagePrefix: "Solar devnet message:\n",
+        addressCharacter: "d",
+        bip32: { public: 70617039, private: 70615956 },
+        pubKeyHash: 90,
+        nethash: "c9b03ab996ef3ac216a2ac53eaee71118cbf7995fa44449a7fb7f94bbe18bcca",
+        wif: 252,
+        slip44: 1,
+        client: { token: "dROOT", symbol: "dRT", explorer: "" },
+    },
+    milestones: [
+        {
+            height: 1,
+            activeDelegates: 53,
+            blockTime: 8,
+            block: { version: 0, maxTransactions: 150, maxPayload: 2097152 },
+            blocksToRevokeDelegateResignation: 106,
+            epoch: "2026-09-25T20:05:04.000Z",
+            reward: 0,
+            burn: { feeBasisPoints: 9000, txAmount: 2000000 },
+            donations: {},
+            legacyTransfer: false,
+            legacyVote: false,
+            acceptLegacySchnorrTransactions: false,
+            bip340: true,
+        },
+    ],
+    genesisBlock: { transactions: [] },
+    exceptions: {},
+});
+
+const main = async () => {
+    let Crypto;
+    let Transactions;
+    try {
+        Crypto = require(path.join(SOLAR_DIR, "packages/crypto/dist"));
+        Transactions = require(path.join(SOLAR_DIR, "packages/transactions/dist"));
+    } catch (error) {
+        fail("load Solar packages", error.message);
+        return;
+    }
+
+    Crypto.Managers.configManager.setConfig(devnetConfig());
+    Crypto.Managers.configManager.setHeight(1);
+
+    const { Errors } = Transactions;
+    const { TransactionHandler, Solar } = Transactions.Handlers;
+
+    // Stub the base-class check, so a call that gets past the vote-specific checks is visible.
+    let baseCheckReached = false;
+    TransactionHandler.prototype.throwIfCannotBeApplied = async function () {
+        baseCheckReached = true;
+    };
+
+    const handler = Object.create(Solar.VoteTransactionHandler.prototype);
+    handler.walletRepository = { hasByUsername: (username) => username.startsWith("genesis_") };
+
+    // A stub sender wallet. `votes` undefined means the attribute is not set at all.
+    const stubWallet = (votes) => ({
+        getAttribute: (key, defaultValue) => {
+            if (key !== "votes") {
+                throw new Error(`unexpected attribute ${key}`);
+            }
+            return votes === undefined ? defaultValue : votes;
+        },
+        hasAttribute: (key) => key === "votes" && votes !== undefined,
+    });
+
+    // Runs the method and returns the name of the error class, or "base check reached".
+    const outcome = async (walletVotes, newVotes) => {
+        baseCheckReached = false;
+        const transaction = { data: { asset: { votes: newVotes } } };
+        try {
+            await handler.throwIfCannotBeApplied(transaction, stubWallet(walletVotes));
+        } catch (error) {
+            return { name: error.constructor.name, error };
+        }
+        return { name: baseCheckReached ? "base check reached" : "returned without the base check" };
+    };
+
+    const expectError = async (walletVotes, newVotes, ErrorClass, message) => {
+        const result = await outcome(walletVotes, newVotes);
+        if (!(result.error instanceof ErrorClass)) {
+            return `got ${result.name}${result.error ? `: ${result.error.message}` : ""}`;
+        }
+        return result.error.message === message ? true : `message: ${result.error.message}`;
+    };
+    const expectNoIdentityError = async (walletVotes, newVotes) => {
+        const result = await outcome(walletVotes, newVotes);
+        return result.name === "base check reached" ? true : `got ${result.name}`;
+    };
+
+    const identical = "Failed to apply transaction, because these votes are identical to the existing votes";
+    const notVoted = "Failed to apply transaction, because the wallet has not voted";
+    const current = () =>
+        new Map([
+            ["genesis_1", 60],
+            ["genesis_2", 40],
+        ]);
+
+    await check("same votes in a different key order raise AlreadyVotedForSameDelegatesError", () =>
+        expectError(current(), { genesis_2: 40, genesis_1: 60 }, Errors.AlreadyVotedForSameDelegatesError, identical),
+    );
+
+    await check("same votes in the same key order raise AlreadyVotedForSameDelegatesError", () =>
+        expectError(current(), { genesis_1: 60, genesis_2: 40 }, Errors.AlreadyVotedForSameDelegatesError, identical),
+    );
+
+    await check("{} from a wallet with an empty votes Map raises NoVoteError", () =>
+        expectError(new Map(), {}, Errors.NoVoteError, notVoted),
+    );
+
+    await check("{} from a wallet with no votes attribute raises NoVoteError", () =>
+        expectError(undefined, {}, Errors.NoVoteError, notVoted),
+    );
+
+    await check("different votes {genesis_1: 100} raise neither identity error", () =>
+        expectNoIdentityError(current(), { genesis_1: 100 }),
+    );
+
+    await check("the same names with other percentages raise neither identity error", () =>
+        expectNoIdentityError(current(), { genesis_1: 40, genesis_2: 60 }),
+    );
+
+    await check("an unvote {} from a wallet that votes raises neither identity error", () =>
+        expectNoIdentityError(current(), {}),
+    );
+
+    await check("a first vote from a wallet with no votes raises neither identity error", () =>
+        expectNoIdentityError(new Map(), { genesis_1: 100 }),
+    );
+
+    await check("check order: more than activeDelegates votes still fails first", async () => {
+        const votes = {};
+        for (let i = 1; i <= 54; i++) {
+            votes[`genesis_${i}`] = i <= 46 ? 1.85 : 1.89;
+        }
+        const walletVotes = new Map(Object.entries(votes));
+        const result = await outcome(walletVotes, votes);
+        return result.error instanceof Errors.VotedForTooManyDelegatesError ? true : `got ${result.name}`;
+    });
+
+    await check("check order: the identity check comes before the unknown-delegate check", () =>
+        expectError(new Map([["ghost", 100]]), { ghost: 100 }, Errors.AlreadyVotedForSameDelegatesError, identical),
+    );
+
+    await check("check order: an unknown delegate in a new vote still raises VotedForNonDelegateError", async () => {
+        const result = await outcome(current(), { ghost: 100 });
+        return result.error instanceof Errors.VotedForNonDelegateError ? true : `got ${result.name}`;
+    });
+};
+
+main()
+    .catch((error) => fail("test script", error && error.stack))
+    .finally(() => {
+        console.log(`${failed === 0 ? "OK" : "FAILED"}: ${passed} passed, ${failed} failed (SOLAR_DIR=${SOLAR_DIR})`);
+        process.exit(failed === 0 ? 0 : 1);
+    });

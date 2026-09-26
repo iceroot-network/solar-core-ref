@@ -70,7 +70,9 @@ export class VoteTransactionHandler extends TransactionHandler {
             throw new VotedForTooManyDelegatesError(activeDelegates);
         }
 
-        if (AppUtils.isEqual(transaction.data.asset.votes, wallet.getAttribute("votes"))) {
+        if (
+            AppUtils.isEqual(transaction.data.asset.votes, Object.fromEntries(wallet.getAttribute("votes", new Map())))
+        ) {
             if (Object.keys(transaction.data.asset.votes).length === 0) {
                 throw new NoVoteError();
             }
