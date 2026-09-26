@@ -121,9 +121,9 @@ accepted("2^53 - 1 as a number", [heightOne(table({ 7: 9007199254740991 }))]);
 accepted("ranks beyond activeDelegates are not checked", [heightOne(table({ 54: 180000000, 55: "not checked" }))]);
 accepted("dynamicReward disabled without a table", [heightOne({ enabled: false })]);
 accepted("a later dynamicReward: null", [heightOne(table()), { height: 100, dynamicReward: null }]);
-accepted("a shrink to 51 ranks where activeDelegates becomes 51", [
-    heightOne(table()),
-    { height: 107, activeDelegates: 51, dynamicReward: { ranks: ranks(51) } },
+accepted("a shrink to 51 ranks where activeDelegates is 51 from height 1", [
+    { ...heightOne(table()), activeDelegates: 51 },
+    { height: 107, dynamicReward: { ranks: ranks(51) } },
 ]);
 for (const preset of ["mainnet", "testnet"]) {
     check(`accepted: the ${preset} preset`, () => {
@@ -136,7 +136,7 @@ for (const preset of ["mainnet", "testnet"]) {
 
 refused("rank 53 missing at height 1", [heightOne({ enabled: true, secondaryReward: 180000000, ranks: ranks(52) })], 1, "rank 53");
 refused("a shrink to 51 ranks while activeDelegates stays 53", [heightOne(table()), { height: 100, dynamicReward: { ranks: ranks(51) } }], 100, "rank 52");
-refused("activeDelegates raised to 55 without extending the table", [heightOne(table()), { height: 107, activeDelegates: 55 }], 107, "rank 54");
+refused("activeDelegates 55 with a 53-rank table", [{ ...heightOne(table()), activeDelegates: 55 }], 1, "rank 54");
 refused("a later milestone enables a table that is not there", [heightOne({ enabled: false }), { height: 100, dynamicReward: { enabled: true, secondaryReward: 0 } }], 100, "ranks");
 refused("ranks: null", [heightOne({ enabled: true, secondaryReward: 180000000, ranks: null })], 1, "ranks");
 refused("ranks as an array", [heightOne({ enabled: true, secondaryReward: 180000000, ranks: Object.values(ranks(53)) })], 1, "ranks");

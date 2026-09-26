@@ -224,12 +224,30 @@ export class ConfigManager {
             throw new Error();
         }
 
+        // The block time and the number of active delegates are fixed from height 1: the multi-span machinery is
+        // removed, so every merged milestone must keep the first milestone's values
+        const first = this.getMilestones()[0] ?? { height: 1 };
+        for (const key of ["blockTime", "activeDelegates"]) {
+            if (!Number.isSafeInteger(first[key]) || first[key] < 1) {
+                throw new InvalidMilestoneConfigurationError(
+                    `Bad milestone at height: ${first.height}. ${key} must be a positive integer`,
+                );
+            }
+        }
+
         for (const milestone of this.getMilestones()) {
             const fail = (message: string): never => {
                 throw new InvalidMilestoneConfigurationError(
                     `Bad milestone at height: ${milestone.height}. ${message}`,
                 );
             };
+
+            for (const key of ["blockTime", "activeDelegates"]) {
+                if (milestone[key] !== first[key]) {
+                    const value: string = JSON.stringify(milestone[key]);
+                    fail(`${key} is ${value}, but it is ${first[key]} at height ${first.height} and cannot change`);
+                }
+            }
 
             const burn = milestone.burn;
             if (typeof burn !== "object" || burn === null || Array.isArray(burn)) {

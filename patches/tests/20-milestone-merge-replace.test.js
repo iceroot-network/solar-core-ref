@@ -80,9 +80,10 @@ const configure = (milestones) =>
     Managers.configManager.setConfig({ network, milestones, exceptions: {}, genesisBlock: { transactions: [] } });
 
 configure([
-    heightOne(),
-    // The shrink comes with activeDelegates 51 at a round start, so the table still covers every active rank (patch 26)
-    { height: 107, activeDelegates: 51, dynamicReward: { ranks: ranks(51) } },
+    // activeDelegates is 51 from height 1 (patch 28 refuses a later change), so the table shrunk at 107 still covers
+    // every active rank (patch 26)
+    { ...heightOne(), activeDelegates: 51 },
+    { height: 107, dynamicReward: { ranks: ranks(51) } },
     {
         height: 200,
         donations: { [ADDRESS_A]: { basisPoints: 500, purpose: "purpose-a" } },
