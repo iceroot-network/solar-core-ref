@@ -270,18 +270,34 @@ export class RoundState implements Contracts.State.RoundState {
         roundInfo: Contracts.Shared.RoundInfo,
         delegates: Contracts.State.Wallet[],
     ): Contracts.State.Wallet[] {
+        // Unbiased Fisher-Yates (Durstenfeld) shuffle. The byte stream is the seed, then
+        // SHA-256 of the previous 32-byte block; each draw reads a u32 (little-endian) and rejects the
+        // values that would make `r % bound` biased.
         const seedSource: string = roundInfo.round.toString();
         let currentSeed: Buffer = Crypto.HashAlgorithms.sha256(seedSource);
+        let offset: number = 0;
+
+        const draw = (bound: number): number => {
+            const limit: number = 0x100000000 - (0x100000000 % bound);
+            for (;;) {
+                if (offset === currentSeed.length) {
+                    currentSeed = Crypto.HashAlgorithms.sha256(currentSeed);
+                    offset = 0;
+                }
+                const value: number = currentSeed.readUInt32LE(offset);
+                offset += 4;
+                if (value < limit) {
+                    return value % bound;
+                }
+            }
+        };
 
         delegates = delegates.map((delegate) => delegate.clone());
-        for (let i = 0, delCount = delegates.length; i < delCount; i++) {
-            for (let x = 0; x < 4 && i < delCount; i++, x++) {
-                const newIndex = currentSeed[x] % delCount;
-                const b = delegates[newIndex];
-                delegates[newIndex] = delegates[i];
-                delegates[i] = b;
-            }
-            currentSeed = Crypto.HashAlgorithms.sha256(currentSeed);
+        for (let i = delegates.length - 1; i > 0; i--) {
+            const j: number = draw(i + 1);
+            const b = delegates[i];
+            delegates[i] = delegates[j];
+            delegates[j] = b;
         }
 
         return delegates;
@@ -312,12 +328,37 @@ export class RoundState implements Contracts.State.RoundState {
         const prevRoundState = await this.getDposPreviousRoundState(blocks, roundInfo);
 
         // TODO: Move to Dpos
+        const rankedAtRoundStart: Set<string> = new Set();
         for (const prevRoundDelegateWallet of prevRoundState.getActiveDelegates()) {
             // ! name suggest that this is pure function
             // ! when in fact it is manipulating current wallet repository setting delegate ranks
             const username = prevRoundDelegateWallet.getAttribute("delegate.username");
             const delegateWallet = this.walletRepository.findByUsername(username);
             delegateWallet.setAttribute("delegate.rank", prevRoundDelegateWallet.getAttribute("delegate.rank"));
+            rankedAtRoundStart.add(username);
+        }
+
+        // A running node ranks delegates only at round starts, so a delegate that had no rank at the start of
+        // this round (resigned then, or registered since) has none until the next round start
+        for (const delegateWallet of this.walletRepository.allByUsername()) {
+            if (
+                !rankedAtRoundStart.has(delegateWallet.getAttribute("delegate.username")) &&
+                delegateWallet.hasAttribute("delegate.rank")
+            ) {
+                delegateWallet.forgetAttribute("delegate.rank");
+            }
+        }
+
+        // As setDelegatesRound does at a round start, delegate.round marks this round's delegates and no other
+        const roundDelegates: Set<string> = new Set(
+            prevRoundState.getRoundDelegates().map((delegate) => delegate.getAttribute("delegate.username")),
+        );
+        for (const delegateWallet of this.walletRepository.allByUsername()) {
+            if (roundDelegates.has(delegateWallet.getAttribute("delegate.username"))) {
+                delegateWallet.setAttribute("delegate.round", roundInfo.round);
+            } else if (delegateWallet.hasAttribute("delegate.round")) {
+                delegateWallet.forgetAttribute("delegate.round");
+            }
         }
 
         // ! return readonly array instead of taking slice

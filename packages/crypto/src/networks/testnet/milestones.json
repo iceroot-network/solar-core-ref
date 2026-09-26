@@ -10,7 +10,7 @@
         "blocksToRevokeDelegateResignation": 106,
         "blockTime": 8,
         "burn": {
-            "feePercent": 90,
+            "feeBasisPoints": 9000,
             "txAmount": 2000000
         },
         "dynamicFees": {
@@ -137,11 +137,11 @@
         "acceptLegacySchnorrTransactions": false,
         "donations": {
             "DSXP3m8MJhqZvybUMCnUkfAP5PQ4aVjozy": {
-                "percent": 5,
+                "basisPoints": 500,
                 "purpose": "testing"
             },
             "D646b6dx3sW5NAgMDTKAZ2hdC57K1BeRaK": {
-                "percent": 5,
+                "basisPoints": 500,
                 "purpose": "voting"
             }
         },

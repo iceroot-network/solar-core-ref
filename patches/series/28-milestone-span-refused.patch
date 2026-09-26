@@ -1,0 +1,362 @@
+From f1825e8d9584a442ff04deeff3493fb6f3341501 Mon Sep 17 00:00:00 2001
+From: NayiemW <37852059+NayiemW@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 07:45:50 +0000
+Subject: [PATCH] Refuse a milestone that changes the block time or delegate
+ count
+
+validateMergedMilestones() now refuses, at start, any milestone file
+that changes the block time or the number of active delegates after
+height 1. IceRoot removes the multi-span block time and delegate-count
+machinery and keeps 8-second blocks with 53 validators. Solar 4.3.1
+and the series without this patch load such a file and run the
+multi-span code; with the refusal that code only ever sees one span.
+It stays in place (crypto/src/crypto/slots.ts,
+kernel/src/utils/get-blocktime-lookup.ts and the delegate-count spans
+of the round calculators); the patch changes no other file.
+
+The rule, before the checks of patches 22, 23 and 26:
+- the first merged milestone (the one in force at height 1) must have
+  blockTime and activeDelegates, each a positive safe integer;
+- at every merged milestone, blockTime and activeDelegates must equal
+  the first milestone's values (===).
+The values are the numbers that JSON.parse reads from the file, so
+8.0, 8e0 and 8.0000000000000001 are all the number 8 and are accepted,
+and 9007199254740993 reads as 2^53 and is refused.
+A refusal is InvalidMilestoneConfigurationError, "Bad milestone at
+height: <h>. <key> ...", naming the height and the key. The merged
+values are compared, because patch 20 changed the merge semantics: a
+later milestone that restates the same number is accepted, while a
+string, null or any other number is refused. Solar's own
+validateMilestones() still runs first on the raw list and refuses a
+delegate-count change outside a round start with its own message;
+every file it refuses is refused by this rule too, so the accept set
+is this rule's alone. The pool and snapshot workers feed the merged
+list back to setConfig: for an accepted file that list is accepted as
+well.
+
+This is start-up validation only: every file that is accepted behaves
+as before.
+
+Also in this commit, tests of earlier patches that used a later
+activeDelegates change: test 20's rank-table shrink at 107 now has
+activeDelegates 51 from height 1 instead of a change to 51 at 107; test
+26's accepted shrink does the same, and its "raised to 55" case becomes
+activeDelegates 55 at height 1 with a 53-rank table, refused at height
+1 for rank 54. Their results are as before: both pass without this
+patch and fail on b45369d7 (test 20 3 of 9, test 26 34 of 44).
+
+Checked beyond the test with this build: the mainnet and testnet
+presets load, and so do the milestones of generated devnets.
+
+Test: patches/tests/28-milestone-span-refused.test.js. Refused, naming
+the height and the key: blockTime 8 then 6 at 107, then 10 at 100;
+activeDelegates 53 then 51 at 107 (a round start, which Solar's own
+check allows), then 55, and 51 then back to 53; a file that changes
+both; a later "8", null or 53.5; both keys missing, 0, -8, 1.5, "8",
+null or 2^53 at height 1; from JSON text, 9007199254740993 for either
+key and activeDelegates -0 at height 1. Accepted: values restated at
+107 and 213 (no next blockTime milestone is found, slot 1,000 is
+8,000 s after the epoch); from JSON text, blockTime 8e0 and
+activeDelegates 5.3e1 at height 1, and 8.0, 53.0 and 8.0000000000000001
+restated at 107; both keys 2^53 - 1; the merged list fed back, both
+presets and a generated devnet's milestones. It fails without this
+patch (27 of 39) and on b45369d7 (27 of 39), and passes here. All tests
+in patches/tests pass.
+
+Patch: 28
+Consensus: no
+---
+ packages/crypto/src/managers/config.ts        |  18 ++
+ .../tests/20-milestone-merge-replace.test.js  |   7 +-
+ .../tests/26-reward-table-validated.test.js   |   8 +-
+ .../tests/28-milestone-span-refused.test.js   | 198 ++++++++++++++++++
+ 4 files changed, 224 insertions(+), 7 deletions(-)
+ create mode 100644 patches/tests/28-milestone-span-refused.test.js
+
+diff --git a/packages/crypto/src/managers/config.ts b/packages/crypto/src/managers/config.ts
+index 7fc4ac6f3..6bbc1d0db 100644
+--- a/packages/crypto/src/managers/config.ts
++++ b/packages/crypto/src/managers/config.ts
+@@ -224,6 +224,17 @@ export class ConfigManager {
+             throw new Error();
+         }
+ 
++        // The block time and the number of active delegates are fixed from height 1: the multi-span machinery is
++        // removed, so every merged milestone must keep the first milestone's values
++        const first = this.getMilestones()[0] ?? { height: 1 };
++        for (const key of ["blockTime", "activeDelegates"]) {
++            if (!Number.isSafeInteger(first[key]) || first[key] < 1) {
++                throw new InvalidMilestoneConfigurationError(
++                    `Bad milestone at height: ${first.height}. ${key} must be a positive integer`,
++                );
++            }
++        }
++
+         for (const milestone of this.getMilestones()) {
+             const fail = (message: string): never => {
+                 throw new InvalidMilestoneConfigurationError(
+@@ -231,6 +242,13 @@ export class ConfigManager {
+                 );
+             };
+ 
++            for (const key of ["blockTime", "activeDelegates"]) {
++                if (milestone[key] !== first[key]) {
++                    const value: string = JSON.stringify(milestone[key]);
++                    fail(`${key} is ${value}, but it is ${first[key]} at height ${first.height} and cannot change`);
++                }
++            }
++
+             const burn = milestone.burn;
+             if (typeof burn !== "object" || burn === null || Array.isArray(burn)) {
+                 fail("burn must be an object with feeBasisPoints (9000 = 90%)");
+diff --git a/patches/tests/20-milestone-merge-replace.test.js b/patches/tests/20-milestone-merge-replace.test.js
+index 4cc747812..3fd5b6b96 100644
+--- a/patches/tests/20-milestone-merge-replace.test.js
++++ b/patches/tests/20-milestone-merge-replace.test.js
+@@ -80,9 +80,10 @@ const configure = (milestones) =>
+     Managers.configManager.setConfig({ network, milestones, exceptions: {}, genesisBlock: { transactions: [] } });
+ 
+ configure([
+-    heightOne(),
+-    // The shrink comes with activeDelegates 51 at a round start, so the table still covers every active rank (patch 26)
+-    { height: 107, activeDelegates: 51, dynamicReward: { ranks: ranks(51) } },
++    // activeDelegates is 51 from height 1 (patch 28 refuses a later change), so the table shrunk at 107 still covers
++    // every active rank (patch 26)
++    { ...heightOne(), activeDelegates: 51 },
++    { height: 107, dynamicReward: { ranks: ranks(51) } },
+     {
+         height: 200,
+         donations: { [ADDRESS_A]: { basisPoints: 500, purpose: "purpose-a" } },
+diff --git a/patches/tests/26-reward-table-validated.test.js b/patches/tests/26-reward-table-validated.test.js
+index 7cb98bb7b..13783c8b7 100644
+--- a/patches/tests/26-reward-table-validated.test.js
++++ b/patches/tests/26-reward-table-validated.test.js
+@@ -121,9 +121,9 @@ accepted("2^53 - 1 as a number", [heightOne(table({ 7: 9007199254740991 }))]);
+ accepted("ranks beyond activeDelegates are not checked", [heightOne(table({ 54: 180000000, 55: "not checked" }))]);
+ accepted("dynamicReward disabled without a table", [heightOne({ enabled: false })]);
+ accepted("a later dynamicReward: null", [heightOne(table()), { height: 100, dynamicReward: null }]);
+-accepted("a shrink to 51 ranks where activeDelegates becomes 51", [
+-    heightOne(table()),
+-    { height: 107, activeDelegates: 51, dynamicReward: { ranks: ranks(51) } },
++accepted("a shrink to 51 ranks where activeDelegates is 51 from height 1", [
++    { ...heightOne(table()), activeDelegates: 51 },
++    { height: 107, dynamicReward: { ranks: ranks(51) } },
+ ]);
+ for (const preset of ["mainnet", "testnet"]) {
+     check(`accepted: the ${preset} preset`, () => {
+@@ -136,7 +136,7 @@ for (const preset of ["mainnet", "testnet"]) {
+ 
+ refused("rank 53 missing at height 1", [heightOne({ enabled: true, secondaryReward: 180000000, ranks: ranks(52) })], 1, "rank 53");
+ refused("a shrink to 51 ranks while activeDelegates stays 53", [heightOne(table()), { height: 100, dynamicReward: { ranks: ranks(51) } }], 100, "rank 52");
+-refused("activeDelegates raised to 55 without extending the table", [heightOne(table()), { height: 107, activeDelegates: 55 }], 107, "rank 54");
++refused("activeDelegates 55 with a 53-rank table", [{ ...heightOne(table()), activeDelegates: 55 }], 1, "rank 54");
+ refused("a later milestone enables a table that is not there", [heightOne({ enabled: false }), { height: 100, dynamicReward: { enabled: true, secondaryReward: 0 } }], 100, "ranks");
+ refused("ranks: null", [heightOne({ enabled: true, secondaryReward: 180000000, ranks: null })], 1, "ranks");
+ refused("ranks as an array", [heightOne({ enabled: true, secondaryReward: 180000000, ranks: Object.values(ranks(53)) })], 1, "ranks");
+diff --git a/patches/tests/28-milestone-span-refused.test.js b/patches/tests/28-milestone-span-refused.test.js
+new file mode 100644
+index 000000000..f14323465
+--- /dev/null
++++ b/patches/tests/28-milestone-span-refused.test.js
+@@ -0,0 +1,198 @@
++"use strict";
++
++// Patch 28 milestone-span-refused.
++// The block time and the number of active delegates are fixed from height 1: the multi-span machinery is
++// out of the rules, and a milestone file that changes either after height 1 is refused at start. setConfig
++// refuses any configuration whose merged blockTime or activeDelegates at some milestone differs from the
++// value at height 1, with InvalidMilestoneConfigurationError naming the height and the key, and it requires
++// both keys at height 1 as positive safe integers. The merged values are compared (patch 20 changed the merge
++// semantics), so a later milestone that restates the same value is accepted. Solar 4.3.1 and the series without
++// this patch load such files and run the multi-span code in slots.ts, which stays in place and now only sees
++// one span.
++// The values are the numbers that JSON.parse reads from the file: 8.0, 8e0 and 8.0000000000000001 are all the
++// number 8 and are accepted, and 9007199254740993 reads as 2^53 and is refused. The checks marked "JSON text"
++// parse their values from such text, so that a loader that reads the file differently (for example as u64) can
++// be checked against them.
++// Usage: SOLAR_DIR=<built Solar checkout> node patches/tests/28-milestone-span-refused.test.js
++// DEVNET_CRYPTO may point at a generated network's crypto directory; when it exists its milestones must load.
++
++const fs = require("fs");
++const path = require("path");
++
++const SOLAR_DIR = process.env.SOLAR_DIR || path.resolve(__dirname, "../..");
++const DEVNET_CRYPTO = process.env.DEVNET_CRYPTO || path.join(__dirname, "devnet-crypto");
++const { Crypto, Errors, Managers } = require(path.join(SOLAR_DIR, "packages/crypto/dist"));
++
++let passed = 0;
++let failed = 0;
++const check = (name, fn) => {
++    try {
++        const detail = fn();
++        if (detail === true) {
++            passed++;
++            console.log(`PASS ${name}`);
++        } else {
++            failed++;
++            console.log(`FAIL ${name}: ${detail}`);
++        }
++    } catch (error) {
++        failed++;
++        console.log(`FAIL ${name}: ${error.message.split("\n")[0]}`);
++    }
++};
++
++const network = {
++    name: "devnet",
++    messagePrefix: "Solar devnet message:\n",
++    addressCharacter: "d",
++    bip32: { public: 70617039, private: 70615956 },
++    pubKeyHash: 90,
++    nethash: "c9b03ab996ef3ac216a2ac53eaee71118cbf7995fa44449a7fb7f94bbe18bcca",
++    wif: 252,
++    slip44: 1,
++    client: { token: "dROOT", symbol: "dRT", explorer: "" },
++};
++
++// The height-1 milestone of the test template (see patches/README.md), with the given overrides; a key whose
++// override is undefined is removed.
++const heightOne = (overrides = {}) => {
++    const milestone = {
++        height: 1,
++        activeDelegates: 53,
++        block: { version: 0, maxTransactions: 150, maxPayload: 2097152 },
++        blocksToRevokeDelegateResignation: 106,
++        blockTime: 8,
++        burn: { feeBasisPoints: 9000, txAmount: 2000000 },
++        epoch: "2026-09-25T20:05:04.000Z",
++        fees: { staticFees: { transfer: 50000000 } },
++        legacyTransfer: false,
++        legacyVote: false,
++        p2p: { minimumVersions: [">=4.3.0"] },
++        transfer: { maximum: 256, minimum: 1 },
++        reward: 0,
++        bip340: true,
++        acceptLegacySchnorrTransactions: false,
++        dynamicReward: { enabled: false },
++        donations: {},
++        ...overrides,
++    };
++    for (const [key, value] of Object.entries(overrides)) {
++        if (value === undefined) {
++            delete milestone[key];
++        }
++    }
++    return milestone;
++};
++
++const configure = (milestones) =>
++    Managers.configManager.setConfig({ network, milestones, exceptions: {}, genesisBlock: { transactions: [] } });
++
++const accepted = (name, milestones, verify) =>
++    check(`accepted: ${name}`, () => {
++        configure(milestones);
++        return verify ? verify() : true;
++    });
++
++// A refusal must be InvalidMilestoneConfigurationError and name the height and the key.
++const refused = (name, milestones, height, key) =>
++    check(`refused: ${name}`, () => {
++        try {
++            configure(milestones);
++        } catch (error) {
++            if (!(error instanceof Errors.InvalidMilestoneConfigurationError)) {
++                return `threw ${error.constructor.name}: ${error.message}`;
++            }
++            for (const part of [`height: ${height}.`, key]) {
++                if (!error.message.includes(part)) {
++                    return `message "${error.message}" does not name "${part}"`;
++                }
++            }
++            return true;
++        }
++        const cm = Managers.configManager;
++        return `setConfig accepted it; blockTime ${cm.getMilestone(1).blockTime} -> ${cm.getMilestone(height).blockTime}, activeDelegates ${cm.getMilestone(1).activeDelegates} -> ${cm.getMilestone(height).activeDelegates}`;
++    });
++
++// A change of either key after height 1.
++
++refused("blockTime 8, then 6 at 107", [heightOne(), { height: 107, blockTime: 6 }], 107, "blockTime");
++refused("blockTime 8, then 10 at 100 (not a round start)", [heightOne(), { height: 100, blockTime: 10 }], 100, "blockTime");
++refused("activeDelegates 53, then 51 at 107 (a round start, which Solar's own check allows)", [heightOne(), { height: 107, activeDelegates: 51 }], 107, "activeDelegates");
++refused("activeDelegates 53, then 55 at 107", [heightOne(), { height: 107, activeDelegates: 55 }], 107, "activeDelegates");
++refused("activeDelegates 53, 51 at 107, back to 53 at 158 (round starts)", [heightOne(), { height: 107, activeDelegates: 51 }, { height: 158, activeDelegates: 53 }], 107, "activeDelegates");
++refused("a file that changes both: blockTime 10 at 107, activeDelegates 51 at 213", [heightOne(), { height: 107, blockTime: 10 }, { height: 213, activeDelegates: 51 }], 107, "blockTime");
++refused("a later blockTime \"8\" (a string, not the number 8)", [heightOne(), { height: 50, blockTime: "8" }], 50, "blockTime");
++refused("a later blockTime null", [heightOne(), { height: 50, blockTime: null }], 50, "blockTime");
++refused("a later activeDelegates 53.5 (at a round start)", [heightOne(), { height: 107, activeDelegates: 53.5 }], 107, "activeDelegates");
++// Solar's own check on the raw list (validateMilestones) still runs first and refuses a change of the delegate
++// count outside a round start with its own message (unchanged).
++refused("activeDelegates 53, then 51 at 100 (not a round start: Solar's own check, unchanged)", [heightOne(), { height: 100, activeDelegates: 51 }], 100, "The number of delegates can only be changed at the beginning of a new round");
++refused("the first change is named when two milestones change", [heightOne(), { height: 50, blockTime: 6 }, { height: 60, blockTime: 4 }], 50, "blockTime");
++
++// Both keys at height 1, as positive safe integers.
++
++for (const [label, value] of [
++    ["missing", undefined],
++    ["0", 0],
++    ["-8", -8],
++    ["1.5", 1.5],
++    ["\"8\"", "8"],
++    ["null", null],
++    ["2^53", 9007199254740992],
++]) {
++    refused(`blockTime ${label} at height 1`, [heightOne({ blockTime: value })], 1, "blockTime");
++    refused(`activeDelegates ${label} at height 1`, [heightOne({ activeDelegates: value })], 1, "activeDelegates");
++}
++
++// JSON text: the number as JSON.parse reads it from the file.
++refused("JSON text blockTime 9007199254740993 at height 1 (JSON.parse reads 2^53)", [heightOne(JSON.parse('{"blockTime": 9007199254740993}'))], 1, "blockTime");
++refused("JSON text activeDelegates 9007199254740993 at height 1 (JSON.parse reads 2^53)", [heightOne(JSON.parse('{"activeDelegates": 9007199254740993}'))], 1, "activeDelegates");
++refused("JSON text activeDelegates -0 at height 1", [heightOne(JSON.parse('{"activeDelegates": -0}'))], 1, "activeDelegates");
++
++// Accepted: one value throughout, restated or not.
++
++accepted("blockTime 8 restated at 107, activeDelegates 53 restated at 213", [heightOne(), { height: 107, blockTime: 8 }, { height: 213, activeDelegates: 53 }], () => {
++    const cm = Managers.configManager;
++    const next = cm.getNextMilestoneWithNewKey(1, "blockTime");
++    const values = [1, 107, 150, 213, 300].map((h) => `${cm.getMilestone(h).blockTime}/${cm.getMilestone(h).activeDelegates}`).join(" ");
++    return (!next.found && values === "8/53 8/53 8/53 8/53 8/53") || `values ${values}, next blockTime milestone ${JSON.stringify(next)}`;
++});
++accepted("a later milestone that changes other keys only", [heightOne(), { height: 100, reward: 0, transfer: { maximum: 128 } }]);
++// The values below come from JSON text; each check also confirms the value that JSON.parse produced.
++const readAs = (height, blockTime, activeDelegates) => () => {
++    const milestone = Managers.configManager.getMilestone(height);
++    return (milestone.blockTime === blockTime && milestone.activeDelegates === activeDelegates) || `blockTime/activeDelegates at ${height}: ${milestone.blockTime}/${milestone.activeDelegates}`;
++};
++accepted("JSON text blockTime 8e0 and activeDelegates 5.3e1 at height 1", [heightOne(JSON.parse('{"blockTime": 8e0, "activeDelegates": 5.3e1}'))], readAs(1, 8, 53));
++accepted("JSON text blockTime 8.0 and activeDelegates 53.0 restated at 107", [heightOne(), JSON.parse('{"height": 107, "blockTime": 8.0, "activeDelegates": 53.0}')], readAs(107, 8, 53));
++accepted("JSON text blockTime 8.0000000000000001 restated at 107 (JSON.parse reads 8)", [heightOne(), JSON.parse('{"height": 107, "blockTime": 8.0000000000000001}')], readAs(107, 8, 53));
++accepted("blockTime and activeDelegates 2^53 - 1 at height 1 (the largest accepted)", [heightOne({ blockTime: 9007199254740991, activeDelegates: 9007199254740991 })]);
++accepted("one span in slots.ts: slot 1,000 starts 8,000 s after the epoch", [heightOne(), { height: 107, blockTime: 8 }], () => {
++    const lookup = (height) => Managers.configManager.getMilestone(height).blockTime;
++    const time = Crypto.Slots.getSlotTime(lookup, 1000);
++    return time === 8000 || `getSlotTime(1000) = ${time}`;
++});
++check("accepted: the merged list fed back to setConfig, as the pool and snapshot workers do", () => {
++    configure([heightOne(), { height: 107, activeDelegates: 53 }, { height: 213, reward: 0 }]);
++    const merged = JSON.parse(JSON.stringify(Managers.configManager.getMilestones()));
++    configure(merged);
++    return true;
++});
++for (const preset of ["mainnet", "testnet"]) {
++    check(`accepted: the ${preset} preset`, () => {
++        Managers.configManager.setFromPreset(preset);
++        return true;
++    });
++}
++if (fs.existsSync(path.join(DEVNET_CRYPTO, "milestones.json"))) {
++    check(`accepted: the generated devnet milestones (${DEVNET_CRYPTO})`, () => {
++        const read = (name) => JSON.parse(fs.readFileSync(path.join(DEVNET_CRYPTO, `${name}.json`), "utf8"));
++        Managers.configManager.setConfig({ network: read("network"), milestones: read("milestones"), exceptions: {}, genesisBlock: read("genesisBlock") });
++        return true;
++    });
++} else {
++    console.log(`SKIP generated devnet milestones: ${DEVNET_CRYPTO}/milestones.json does not exist`);
++}
++
++console.log(`SUMMARY 28-milestone-span-refused: ${passed} passed, ${failed} failed`);
++process.exit(failed === 0 ? 0 : 1);
+-- 
+2.43.0
+

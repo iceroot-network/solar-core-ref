@@ -54,7 +54,7 @@ export class VoteTransactionHandler extends TransactionHandler {
     }
 
     public async isActivated(): Promise<boolean> {
-        return !Managers.configManager.getMilestone().legacyVote;
+        return true;
     }
 
     public async throwIfCannotBeApplied(
@@ -70,7 +70,9 @@ export class VoteTransactionHandler extends TransactionHandler {
             throw new VotedForTooManyDelegatesError(activeDelegates);
         }
 
-        if (AppUtils.isEqual(transaction.data.asset.votes, wallet.getAttribute("votes"))) {
+        if (
+            AppUtils.isEqual(transaction.data.asset.votes, Object.fromEntries(wallet.getAttribute("votes", new Map())))
+        ) {
             if (Object.keys(transaction.data.asset.votes).length === 0) {
                 throw new NoVoteError();
             }
@@ -158,7 +160,10 @@ export class VoteTransactionHandler extends TransactionHandler {
         const previousVotes = await this.getPreviousVotes(transaction);
 
         AppUtils.decreaseVoteBalances(sender, { updateVoters: true, walletRepository: this.walletRepository });
-        sender.setAttribute("votes", previousVotes);
+        sender.setAttribute(
+            "votes",
+            new Map(Object.entries(Utils.sortVotes(Object.fromEntries(previousVotes as Map<string, number>)))),
+        );
         sender.updateVoteBalances();
         AppUtils.increaseVoteBalances(sender, { updateVoters: true, walletRepository: this.walletRepository });
     }

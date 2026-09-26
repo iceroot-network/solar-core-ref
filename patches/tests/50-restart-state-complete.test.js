@@ -1,0 +1,486 @@
+#!/usr/bin/env node
+// Patch 50 restart-state-complete.
+//
+// A state rebuilt at start by the StateBuilder must equal the live node's state, not only in the ranks
+// (patch 47) but in the whole saved state. It did not in delegate.round: the live node sets it on the
+// round's delegates at every round start (DposState.setDelegatesRound), and a delegate registered by a
+// block got round 0, while the StateBuilder path set it on no delegate at all. Also, the live node never
+// cleared it, so a delegate that left the round list kept an old round number, and a delegate
+// registered since the last round start kept 0: history that the chain alone does not give back.
+//
+// With this patch delegate.round marks exactly the current round's delegates: setDelegatesRound clears
+// it on every other delegate, a registration no longer writes round 0, and RoundState's
+// calcPreviousActiveDelegates (restart and revert across a round boundary) sets it on the round's
+// delegates and clears it elsewhere, as setDelegatesRound does at a round start.
+//
+// delegate.version is not rebuilt: the live node takes it from its own forger process (the keys in
+// forger.json, at round starts and when the node is in sync) and from the signed status of peers, not
+// from the chain. It is a node-local restart difference; the last two checks show
+// it is the only difference, and that the node's own "in sync" step (SyncingComplete) restores it for
+// the delegates its forger runs.
+//
+// The scenario is the restart test of patch 47, with the real Wallet, DposState, RoundState, delegate registration
+// handler, StateSaver and SyncingComplete classes and stub repositories: 53 genesis delegates; tx1n2290
+// registers at 30; genesis_53 resigns at 69; genesis_10 resigns at 170; genesis_53 revokes at 176;
+// newcomer registers at 180; restart at 190. The two states are written by the real StateSaver and the
+// files are compared wallet by wallet, every field and attribute value.
+//
+// Usage: SOLAR_DIR=<built Solar checkout> node 50-restart-state-complete.test.js
+"use strict";
+
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+
+const SOLAR_DIR = path.resolve(process.env.SOLAR_DIR || path.join(__dirname, "..", ".."));
+
+const load = (pkg, sub = "") => require(path.join(SOLAR_DIR, "packages", pkg, "dist", sub));
+const { Enums, Identities, Managers, Utils } = load("crypto");
+const { Services, Utils: AppUtils } = load("kernel");
+const { Handlers } = load("transactions");
+const { Wallets } = load("state");
+const { DposState } = load("state", "dpos/dpos");
+const { RoundState } = load("state", "round-state");
+const { StateSaver } = load("state", "state-saver");
+const { SyncingComplete } = load("blockchain", "state-machine/actions/syncing-complete");
+const { BigNumber } = Utils;
+
+let passed = 0;
+let failed = 0;
+
+async function check(name, fn) {
+    try {
+        const outcome = await fn();
+        if (outcome === true) {
+            passed++;
+            console.log(`PASS ${name}`);
+        } else {
+            failed++;
+            console.log(`FAIL ${name}: ${outcome}`);
+        }
+    } catch (error) {
+        failed++;
+        console.log(`FAIL ${name}: threw ${error && error.stack}`);
+    }
+}
+
+// Network configuration template (see patches/README.md).
+function makeConfig() {
+    return {
+        network: {
+            name: "devnet",
+            messagePrefix: "Solar devnet message:\n",
+            addressCharacter: "d",
+            bip32: { public: 70617039, private: 70615956 },
+            pubKeyHash: 90,
+            nethash: "c9b03ab996ef3ac216a2ac53eaee71118cbf7995fa44449a7fb7f94bbe18bcca",
+            wif: 252,
+            slip44: 1,
+            client: { token: "dROOT", symbol: "dRT", explorer: "" },
+        },
+        milestones: [
+            {
+                height: 1,
+                activeDelegates: 53,
+                block: { version: 0, maxTransactions: 150, maxPayload: 2097152 },
+                blocksToRevokeDelegateResignation: 106,
+                blockTime: 8,
+                burn: { feeBasisPoints: 9000, txAmount: 2000000 },
+                epoch: "2026-01-01T00:00:00.000Z",
+                legacyTransfer: false,
+                legacyVote: false,
+                transfer: { maximum: 256, minimum: 1 },
+                reward: 0,
+                acceptLegacySchnorrTransactions: false,
+                bip340: true,
+                donations: {},
+            },
+        ],
+        genesisBlock: { transactions: [] },
+        exceptions: {},
+    };
+}
+
+const RegistrationHandler = Handlers.Core.DelegateRegistrationTransactionHandler;
+
+// Real wallets, with the attributes the delegate registration and resignation handlers register, and votes.
+const attributeSet = new Services.Attributes.AttributeSet();
+for (const key of new Set([
+    "votes",
+    ...Object.create(RegistrationHandler.prototype).walletAttributes(),
+    ...Object.create(Handlers.Core.DelegateResignationTransactionHandler.prototype).walletAttributes(),
+])) {
+    attributeSet.set(key);
+}
+
+// Delegates: genesis_1 .. genesis_53 with falling vote balances; tx1n2290 below all of them; newcomer,
+// registered inside round 4, above all of them.
+const delegate = (username, votes, voters) => {
+    const publicKey = Identities.PublicKey.fromPassphrase(`patch 50 ${username}`);
+    return { username, publicKey, address: Identities.Address.fromPublicKey(publicKey, 90), votes, voters };
+};
+const GENESIS = [];
+for (let i = 1; i <= 53; i++) {
+    GENESIS.push(delegate(`genesis_${i}`, BigNumber.make(1000 - i).times(1e8), 1));
+}
+const TX1N2290 = delegate("tx1n2290", BigNumber.make(900).times(1e8), 2);
+const NEWCOMER = delegate("newcomer", BigNumber.make(5000).times(1e8), 3);
+
+class StubWalletRepository {
+    constructor() {
+        this.wallets = new Map();
+    }
+    findByAddress(address) {
+        if (!this.wallets.has(address)) {
+            this.wallets.set(address, new Wallets.Wallet(address, new Services.Attributes.AttributeMap(attributeSet), false));
+        }
+        return this.wallets.get(address);
+    }
+    index() {}
+    allByAddress() {
+        return [...this.wallets.values()];
+    }
+    allByUsername() {
+        return this.allByAddress().filter((wallet) => wallet.hasAttribute("delegate.username"));
+    }
+    findByUsername(username) {
+        const wallet = this.allByUsername().find((w) => w.getAttribute("delegate.username") === username);
+        if (!wallet) {
+            throw new Error(`no delegate ${username}`);
+        }
+        return wallet;
+    }
+}
+
+const silentLogger = { debug() {}, info() {}, notice() {}, warning() {}, error() {} };
+
+const registration = (d) => ({
+    senderId: d.address,
+    senderPublicKey: d.publicKey,
+    headerType: Enums.TransactionHeaderType.Standard,
+    asset: { delegate: { username: d.username } },
+    data: { senderId: d.address, senderPublicKey: d.publicKey, asset: { delegate: { username: d.username } } },
+});
+
+// The StateBuilder's step for delegate registrations: the real bootstrap over the stored registrations.
+async function bootstrapRegistrations(repository, delegates) {
+    const handler = Object.create(RegistrationHandler.prototype);
+    handler.walletRepository = repository;
+    handler.transactionHistoryService = {
+        async *streamByCriteria() {
+            for (const d of delegates) {
+                yield registration(d);
+            }
+        },
+    };
+    handler.blockRepository = { getDelegatesForgedBlocks: async () => [], getLastForgedBlocks: async () => [] };
+    await handler.bootstrap();
+}
+
+// A registration applied by a block on the live node: the real applyToSender (the base class part, which
+// moves the fee and the nonce, is left out: no balances are compared here that it would change).
+async function applyRegistration(repository, d) {
+    const handler = Object.create(RegistrationHandler.prototype);
+    handler.walletRepository = repository;
+    const base = Object.getPrototypeOf(RegistrationHandler.prototype);
+    const baseApply = base.applyToSender;
+    base.applyToSender = async () => {};
+    try {
+        await handler.applyToSender({ data: registration(d).data });
+    } finally {
+        base.applyToSender = baseApply;
+    }
+    repository.findByAddress(d.address).setPublicKey(d.publicKey);
+}
+
+// Vote balances and voter counts as the votes left them (the same on every path).
+function setVotes(repository, delegates) {
+    for (const d of delegates) {
+        const wallet = repository.findByAddress(d.address);
+        wallet.setAttribute("delegate.voteBalance", d.votes);
+        wallet.setAttribute("delegate.voters", d.voters);
+    }
+}
+
+const resign = (repository, d) => repository.findByAddress(d.address).setAttribute("delegate.resigned", 1);
+const revoke = (repository, d) => repository.findByAddress(d.address).forgetAttribute("delegate.resigned");
+
+function makeDposState(repository) {
+    const dpos = Object.create(DposState.prototype);
+    dpos.logger = silentLogger;
+    dpos.walletRepository = repository;
+    dpos.activeDelegates = [];
+    dpos.roundDelegates = [];
+    dpos.roundInfo = null;
+    return dpos;
+}
+
+// The chain at round 4's start (after block 159): every delegate registered by then, genesis_53 resigned.
+async function roundFourStart() {
+    const repository = new StubWalletRepository();
+    await bootstrapRegistrations(repository, [...GENESIS, TX1N2290]);
+    setVotes(repository, [...GENESIS, TX1N2290]);
+    resign(repository, GENESIS[52]);
+    return repository;
+}
+
+// A RoundState with stubs; its previous-round state is round 4's start, ranked and given its round as
+// DposPreviousRoundState does it (revert the round's blocks in a clone, rank, set the round).
+function makeRoundState(repository, lastHeight) {
+    const roundState = Object.create(RoundState.prototype);
+    roundState.app = { version: () => "4.3.1" };
+    roundState.logger = silentLogger;
+    roundState.events = { dispatch() {} };
+    roundState.walletRepository = repository;
+    roundState.dposState = makeDposState(repository);
+    roundState.stateStore = { getLastBlock: () => ({ data: { height: lastHeight } }) };
+    roundState.databaseService = { deleteRound: async () => {}, saveRound: async () => {} };
+    roundState.triggers = { call: async () => [] };
+    roundState.blocksInCurrentRound = [];
+    roundState.forgingDelegates = [];
+    roundState.getBlocksForRound = async () => [];
+    roundState.getDposPreviousRoundState = async (_blocks, roundInfo) => {
+        const dpos = makeDposState(await roundFourStart());
+        dpos.buildDelegateRanking();
+        dpos.setDelegatesRound(roundInfo);
+        return {
+            getAllDelegates: () => dpos.getAllDelegates(),
+            getActiveDelegates: () => dpos.getActiveDelegates(),
+            getRoundDelegates: () => dpos.getRoundDelegates(),
+        };
+    };
+    return roundState;
+}
+
+// LIVE: the running node from the genesis on. Round starts go through RoundState.applyRound (ranking,
+// setDelegatesRound, and delegate.version for the delegates of its own forger).
+async function liveNode() {
+    const repository = new StubWalletRepository();
+    await bootstrapRegistrations(repository, GENESIS); // the first start, on the genesis block
+    setVotes(repository, GENESIS);
+    const roundState = makeRoundState(repository, 1);
+    await roundState.applyRound(1); // round 1
+    await applyRegistration(repository, TX1N2290); // 30
+    setVotes(repository, [TX1N2290]);
+    await roundState.applyRound(53); // round 2 starts at 54
+    resign(repository, GENESIS[52]); // 69
+    await roundState.applyRound(106); // round 3 starts at 107
+    await roundState.applyRound(159); // round 4 starts at 160
+    resign(repository, GENESIS[9]); // 170
+    revoke(repository, GENESIS[52]); // 176
+    await applyRegistration(repository, NEWCOMER); // 180
+    setVotes(repository, [NEWCOMER]);
+    return repository;
+}
+
+// C: a restart at 190 without a saved state. The StateBuilder bootstraps the registrations from the
+// chain, builds the vote balances and ranks every delegate; then Initialise restores the current round.
+async function rebuiltNode() {
+    const repository = new StubWalletRepository();
+    await bootstrapRegistrations(repository, [...GENESIS, TX1N2290, NEWCOMER]);
+    setVotes(repository, [...GENESIS, TX1N2290, NEWCOMER]);
+    resign(repository, GENESIS[9]);
+    makeDposState(repository).buildDelegateRanking();
+    await makeRoundState(repository, 190).restore();
+    return repository;
+}
+
+// The node's "in sync" step at 190 (SyncingComplete), which sets delegate.version for its forger's keys.
+async function syncingComplete(repository) {
+    const action = Object.create(SyncingComplete.prototype);
+    action.app = { version: () => "4.3.1" };
+    action.events = { dispatch() {} };
+    action.logger = silentLogger;
+    action.blockchain = { getLastHeight: () => 190, dispatch() {} };
+    action.walletRepository = repository;
+    await action.handle();
+}
+
+// The real StateSaver writes the repository at height 190; the file is parsed back.
+async function savedState(repository) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "patch-50-"));
+    const errors = [];
+    const saver = Object.create(StateSaver.prototype);
+    saver.app = { version: () => "4.3.1" };
+    saver.configuration = { get: (key) => (key === "savedStatesPath" ? dir : 0) };
+    saver.logger = { error: (message) => errors.push(String(message).split("\n")[0]) };
+    saver.stateMachine = { stateStore: { getLastBlock: () => ({ data: { height: 190, id: "b".repeat(64) } }) } };
+    saver.walletRepository = repository;
+    saver.byteBufferArray = new Utils.ByteBufferArray();
+    await saver.run();
+    const file = path.join(dir, "b".repeat(64));
+    if (errors.length || !fs.existsSync(file)) {
+        throw new Error(`the state saver failed: ${JSON.stringify(errors)}`);
+    }
+    const bytes = fs.readFileSync(file);
+    fs.rmSync(dir, { recursive: true, force: true });
+    return parseState(bytes);
+}
+
+// The saved-state format of state-saver.ts: version, height, wallet count, then per wallet a bit field,
+// the address and the fields the bits announce.
+function parseState(b) {
+    let o = 0;
+    const u8 = () => b.readUInt8(o++);
+    const u32 = () => {
+        const v = b.readUInt32LE(o);
+        o += 4;
+        return v;
+    };
+    const buf = (n) => {
+        const v = b.subarray(o, o + n);
+        o += n;
+        return v;
+    };
+    const version = buf(u8()).toString();
+    const height = u32();
+    const count = u32();
+    const wallets = new Map();
+    for (let i = 0; i < count; i++) {
+        const bits = u8();
+        const address = buf(34).toString();
+        const wallet = {};
+        if (bits & 1) {
+            wallet.balance = b.readBigInt64LE(o).toString();
+            o += 8;
+        }
+        if (bits & 2) {
+            wallet.nonce = b.readBigUInt64LE(o).toString();
+            o += 8;
+        }
+        if (bits & 4) {
+            wallet.publicKey = buf(33).toString("hex");
+        }
+        if (bits & 8) {
+            wallet.attributes = JSON.parse(buf(u32()).toString());
+        }
+        if (bits & 16) {
+            wallet.voteBalances = JSON.parse(buf(u32()).toString());
+        }
+        wallets.set(address, wallet);
+    }
+    if (o !== b.length) {
+        throw new Error(`${b.length - o} bytes left after ${count} wallets`);
+    }
+    return { version, height, count, wallets };
+}
+
+// Every leaf of a wallet as "path" -> JSON value, so that key order does not matter.
+function leaves(value, prefix = "", out = {}) {
+    if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+        for (const key of Object.keys(value)) {
+            leaves(value[key], prefix ? `${prefix}.${key}` : key, out);
+        }
+    } else {
+        out[prefix] = JSON.stringify(value);
+    }
+    return out;
+}
+
+const usernames = new Map([...GENESIS, TX1N2290, NEWCOMER].map((d) => [d.address, d.username]));
+
+// The differences between two saved states, one line per wallet field ("<name> <path>: A=.. B=..").
+function differences(a, b, labels = ["live", "rebuilt"]) {
+    const lines = [];
+    for (const key of ["version", "height", "count"]) {
+        if (a[key] !== b[key]) {
+            lines.push(`${key}: ${labels[0]} ${a[key]} ${labels[1]} ${b[key]}`);
+        }
+    }
+    for (const address of new Set([...a.wallets.keys(), ...b.wallets.keys()])) {
+        const x = leaves(a.wallets.get(address) || { MISSING: true });
+        const y = leaves(b.wallets.get(address) || { MISSING: true });
+        for (const key of new Set([...Object.keys(x), ...Object.keys(y)])) {
+            if (x[key] !== y[key]) {
+                lines.push(`${usernames.get(address) || address} ${key}: ${labels[0]} ${x[key] ?? "absent"} ${labels[1]} ${y[key] ?? "absent"}`);
+            }
+        }
+    }
+    return lines.sort();
+}
+
+const summary = (lines) => (lines.length <= 6 ? lines.join("; ") : `${lines.length} differences: ${lines.slice(0, 6).join("; ")}; ...`);
+
+// delegate.round of each delegate: username -> round (absent when not set).
+function rounds(repository) {
+    const result = {};
+    for (const wallet of repository.allByUsername()) {
+        if (wallet.hasAttribute("delegate.round")) {
+            result[wallet.getAttribute("delegate.username")] = wallet.getAttribute("delegate.round");
+        }
+    }
+    return result;
+}
+
+async function main() {
+    console.log(`SOLAR_DIR=${SOLAR_DIR}`);
+    Managers.configManager.setConfig(makeConfig());
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "patch-50-temp-"));
+
+    // No forger process on this node: getForgerDelegates() finds no forger.json.
+    process.env.CORE_PATH_TEMP = path.join(tmp, "no-forger");
+
+    const liveRepository = await liveNode();
+    const live = await savedState(liveRepository);
+    await check("live node at 190: delegate.round is 4 on round 4's 53 delegates and absent on the others (base: genesis_53 keeps 2, newcomer 0)", () => {
+        const got = rounds(liveRepository);
+        const wrong = Object.entries(got).filter(([, round]) => round !== 4);
+        const count = Object.keys(got).length;
+        return wrong.length === 0 && count === 53 && got.genesis_53 === undefined && got.newcomer === undefined && got.tx1n2290 === 4
+            ? true
+            : `${count} delegates have a round; not 4: ${JSON.stringify(Object.fromEntries(wrong))}`;
+    });
+
+    await check("StateBuilder restart at 190: the full saved state equals the live node's (before this patch: delegate.round missing)", async () => {
+        const lines = differences(live, await savedState(await rebuiltNode()));
+        return lines.length === 0 ? true : summary(lines);
+    });
+
+    await check("saved-state restart at 190: the full saved state equals the live node's (unchanged)", async () => {
+        const repository = await liveNode();
+        await makeRoundState(repository, 190).restore();
+        const lines = differences(live, await savedState(repository));
+        return lines.length === 0 ? true : summary(lines);
+    });
+
+    // The same function serves a revert across a round boundary: the live node applies 212, starts round 5
+    // (213: newcomer and genesis_53 join the list, tx1n2290 leaves it), then reverts 212 back into round 4.
+    await check("revert of 212 into round 4: the full saved state equals the live node's at 190 (before this patch: round 5 marks stay)", async () => {
+        const repository = await liveNode();
+        const roundState = makeRoundState(repository, 212);
+        await roundState.applyRound(212);
+        await roundState.revertRound(212);
+        const lines = differences(live, await savedState(repository));
+        return lines.length === 0 ? true : summary(lines);
+    });
+
+    // A forger process on this node for the 53 genesis delegates: the live node sets delegate.version on
+    // them at every round start. The rebuilt state lacks it: node-local, not in the chain.
+    fs.mkdirSync(path.join(tmp, "forger"));
+    fs.writeFileSync(
+        path.join(tmp, "forger", "forger.json"),
+        JSON.stringify({ pid: process.pid, publicKeys: GENESIS.map((d) => d.publicKey) }),
+    );
+    process.env.CORE_PATH_TEMP = path.join(tmp, "forger");
+    const liveWithForger = await savedState(await liveNode());
+    const rebuiltWithForger = await rebuiltNode();
+    await check("with a local forger: the StateBuilder state differs from the live one only in delegate.version of the forger's delegates (node-local)", async () => {
+        const lines = differences(liveWithForger, await savedState(rebuiltWithForger));
+        const other = lines.filter((line) => !/^genesis_\d+ attributes\.delegate\.version\.(round|version): live \S+ rebuilt absent$/.test(line));
+        return other.length === 0 && lines.length === 2 * 53 ? true : `${lines.length} differences; not delegate.version: ${summary(other)}`;
+    });
+    await check("with a local forger: after the node's in-sync step (SyncingComplete) the states are equal", async () => {
+        await syncingComplete(rebuiltWithForger);
+        const lines = differences(liveWithForger, await savedState(rebuiltWithForger));
+        return lines.length === 0 ? true : summary(lines);
+    });
+
+    fs.rmSync(tmp, { recursive: true, force: true });
+    console.log(`50-restart-state-complete: ${passed} passed, ${failed} failed`);
+    process.exit(failed === 0 ? 0 : 1);
+}
+
+main().catch((error) => {
+    console.log(`FAIL test harness: ${error && error.stack}`);
+    process.exit(1);
+});

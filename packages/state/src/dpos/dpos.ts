@@ -106,6 +106,15 @@ export class DposState implements Contracts.State.DposState {
             this.activeDelegates[i].setAttribute("delegate.round", roundInfo.round);
             this.roundDelegates.push(this.activeDelegates[i]);
         }
+
+        // delegate.round marks the delegates of the current round only, so that a restart can restore it exactly
+        const roundDelegates: Set<Contracts.State.Wallet> = new Set(this.roundDelegates);
+        for (const delegate of this.walletRepository.allByUsername()) {
+            if (!roundDelegates.has(delegate) && delegate.hasAttribute("delegate.round")) {
+                delegate.forgetAttribute("delegate.round");
+            }
+        }
+
         this.logger.debug(
             `Loaded ${roundInfo.maxDelegates} active ` + AppUtils.pluralise("delegate", roundInfo.maxDelegates),
         );

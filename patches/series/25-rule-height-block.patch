@@ -1,0 +1,1276 @@
+From 7c655dc1ec587701da65987b758c722841671034 Mon Sep 17 00:00:00 2001
+From: NayiemW <37852059+NayiemW@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 02:30:18 +0000
+Subject: [PATCH] Judge the transactions of block H by the milestone at H
+
+Transaction-level rules for block H read the milestone at H, whether
+the block's transactions are decoded (byte or data path), applied,
+reverted, or used for events. Solar read the milestone of the previous
+height, so a rule change at height H reached the transactions of block
+H one block late. Pool admission, pool re-adds and the collator's
+validation read tip + 1, the height of the block the transaction is
+for. Everything else is unchanged; the revoke delay and the collator's
+block budget stay as they are.
+
+ConfigManager gets a scoped height: runAtHeight(h, fn) runs fn in an
+AsyncLocalStorage scope that getHeight() and getMilestone() (with no
+height argument) honour, along fn's own async chain only; outside a
+scope nothing changes. The scopes are opened in:
+- Blocks.Deserialiser.deserialise: the transaction part, at the block's
+  height;
+- BlockFactory.fromData and fromSerialised: the body, at the block's
+  height;
+- BlockState.applyBlock and revertBlock: the body, at H, so the revert
+  after a failed transaction also reads H;
+- pool Processor.process, Service.readdTransactions (inside its lock)
+  and Collator.getBlockCandidateTransactions: at tip + 1. The pool
+  worker inherits it through getHeight(). The processor now injects
+  the StateStore; the collator uses the tip it already reads.
+
+Most of the diff re-indents the wrapped bodies; git show -w shows the
+real change.
+
+Test: patches/tests/25-rule-height-block.test.js (fails on the
+unpatched build, passes here).
+
+Patch: 25
+Consensus: yes
+---
+ packages/crypto/src/blocks/deserialiser.ts |   6 +-
+ packages/crypto/src/blocks/factory.ts      |  55 ++--
+ packages/crypto/src/managers/config.ts     |  15 +-
+ packages/pool/src/collator.ts              | 119 +++----
+ packages/pool/src/processor.ts             | 164 +++++-----
+ packages/pool/src/service.ts               | 237 +++++++-------
+ packages/state/src/block-state.ts          |  92 +++---
+ patches/tests/25-rule-height-block.test.js | 341 +++++++++++++++++++++
+ 8 files changed, 706 insertions(+), 323 deletions(-)
+ create mode 100644 patches/tests/25-rule-height-block.test.js
+
+diff --git a/packages/crypto/src/blocks/deserialiser.ts b/packages/crypto/src/blocks/deserialiser.ts
+index e5c1d052b..cc9acf13b 100644
+--- a/packages/crypto/src/blocks/deserialiser.ts
++++ b/packages/crypto/src/blocks/deserialiser.ts
+@@ -1,4 +1,5 @@
+ import { IBlockData, ITransaction } from "../interfaces";
++import { configManager } from "../managers/config";
+ import { TransactionFactory } from "../transactions";
+ import { BigNumber, ByteBuffer } from "../utils";
+ import { Block } from "./block";
+@@ -20,7 +21,10 @@ export class Deserialiser {
+ 
+         headerOnly = headerOnly || buf.getRemainderLength() === 0;
+         if (!headerOnly) {
+-            transactions = this.deserialiseTransactions(block, buf, options.deserialiseTransactionsUnchecked);
++            // The transactions of block H are decoded under the milestone at H
++            transactions = configManager.runAtHeight(block.height, () =>
++                this.deserialiseTransactions(block, buf, options.deserialiseTransactionsUnchecked),
++            );
+         }
+ 
+         block.id = Block.getId(block);
+diff --git a/packages/crypto/src/blocks/factory.ts b/packages/crypto/src/blocks/factory.ts
+index 3d158c716..d0a2fbc1d 100644
+--- a/packages/crypto/src/blocks/factory.ts
++++ b/packages/crypto/src/blocks/factory.ts
+@@ -1,5 +1,6 @@
+ import { Hash, HashAlgorithms } from "../crypto";
+ import { IBlock, IBlockData, IBlockJson, IKeyPair, ITransaction } from "../interfaces";
++import { configManager } from "../managers/config";
+ import { BigNumber } from "../utils";
+ import { Block } from "./block";
+ import { Deserialiser } from "./deserialiser";
+@@ -49,41 +50,47 @@ export class BlockFactory {
+         data: IBlockData,
+         options: { deserialiseTransactionsUnchecked?: boolean } = {},
+     ): IBlock | undefined {
+-        const block: IBlockData | undefined = Block.applySchema(data);
+-
+-        if (block) {
+-            const serialised: Buffer = Serialiser.serialiseWithTransactions(data);
+-            const block: IBlock = new Block({
+-                ...Deserialiser.deserialise(serialised, false, options),
+-            });
+-
+-            if (block.data.version === 0) {
+-                const username = data.username;
+-                if (!block.data.username && username) {
+-                    block.data.username = username;
++        // The transactions of block H are validated under the milestone at H
++        return configManager.runAtHeight(data.height, () => {
++            const block: IBlockData | undefined = Block.applySchema(data);
++
++            if (block) {
++                const serialised: Buffer = Serialiser.serialiseWithTransactions(data);
++                const block: IBlock = new Block({
++                    ...Deserialiser.deserialise(serialised, false, options),
++                });
++
++                if (block.data.version === 0) {
++                    const username = data.username;
++                    if (!block.data.username && username) {
++                        block.data.username = username;
++                    }
+                 }
+-            }
+ 
+-            block.serialised = serialised.toString("hex");
++                block.serialised = serialised.toString("hex");
+ 
+-            return block;
+-        }
++                return block;
++            }
+ 
+-        return undefined;
++            return undefined;
++        });
+     }
+ 
+     private static fromSerialised(serialised: Buffer): IBlock {
++        // The deserialiser decodes the transactions at the block's height; the rest runs at that height too
+         const deserialised: { data: IBlockData; transactions: ITransaction[] } = Deserialiser.deserialise(serialised);
+ 
+-        const validated: IBlockData | undefined = Block.applySchema(deserialised.data);
++        return configManager.runAtHeight(deserialised.data.height, () => {
++            const validated: IBlockData | undefined = Block.applySchema(deserialised.data);
+ 
+-        if (validated) {
+-            deserialised.data = validated;
+-        }
++            if (validated) {
++                deserialised.data = validated;
++            }
+ 
+-        const block: IBlock = new Block(deserialised);
+-        block.serialised = Serialiser.serialiseWithTransactions(block.data).toString("hex");
++            const block: IBlock = new Block(deserialised);
++            block.serialised = Serialiser.serialiseWithTransactions(block.data).toString("hex");
+ 
+-        return block;
++            return block;
++        });
+     }
+ }
+diff --git a/packages/crypto/src/managers/config.ts b/packages/crypto/src/managers/config.ts
+index a14726716..90e9e6e71 100644
+--- a/packages/crypto/src/managers/config.ts
++++ b/packages/crypto/src/managers/config.ts
+@@ -1,3 +1,4 @@
++import { AsyncLocalStorage } from "async_hooks";
+ import { base58 } from "bstring";
+ import deepmerge from "deepmerge";
+ import get from "lodash.get";
+@@ -21,6 +22,7 @@ export class ConfigManager {
+     private height: number | undefined;
+     private milestone: IMilestone | undefined;
+     private milestones: Record<string, any> | undefined;
++    private readonly ruleHeight = new AsyncLocalStorage<number>();
+ 
+     public constructor() {
+         this.setConfig(networks.testnet as unknown as NetworkConfig);
+@@ -68,7 +70,13 @@ export class ConfigManager {
+     }
+ 
+     public getHeight(): number | undefined {
+-        return this.height;
++        return this.ruleHeight.getStore() ?? this.height;
++    }
++
++    // Runs fn with a scoped height that getHeight() and getMilestone() honour, along fn's own async chain only.
++    // Transaction rules of block H read the milestone at H; the pool reads it at tip + 1
++    public runAtHeight<T>(height: number, fn: () => T): T {
++        return this.ruleHeight.run(height, fn);
+     }
+ 
+     public isNewMilestone(height?: number): boolean {
+@@ -86,8 +94,9 @@ export class ConfigManager {
+             throw new Error();
+         }
+ 
+-        if (!height && this.height) {
+-            height = this.height;
++        const currentHeight = this.getHeight();
++        if (!height && currentHeight) {
++            height = currentHeight;
+         }
+ 
+         if (!height) {
+diff --git a/packages/pool/src/collator.ts b/packages/pool/src/collator.ts
+index b6621c5e9..867b40c2e 100644
+--- a/packages/pool/src/collator.ts
++++ b/packages/pool/src/collator.ts
+@@ -28,71 +28,74 @@ export class Collator implements Contracts.Pool.Collator {
+         exclude: string[],
+     ): Promise<Interfaces.ITransaction[]> {
+         const height: number = this.blockchain.getLastBlock().data.height;
+-        const milestone = Managers.configManager.getMilestone(height);
+-        const blockHeaderSize =
+-            4 + // version
+-            4 + // timestamp
+-            4 + // height
+-            32 + // previousBlockId
+-            4 + // numberOfTransactions
+-            8 + // totalAmount
+-            8 + // totalFee
+-            8 + // reward
+-            4 + // payloadLength
+-            32 + // payloadHash
+-            33; // generatorPublicKey
+-
+-        let bytesLeft: number = milestone.block.maxPayload - blockHeaderSize;
+-
+-        const candidateTransactions: Interfaces.ITransaction[] = [];
+-        const validator: Contracts.State.TransactionValidator = this.createTransactionValidator();
+-        const failedTransactions: Interfaces.ITransaction[] = [];
+-
+-        const transactions: Interfaces.ITransaction[] = Array.from(this.poolQuery.getFromHighestPriority()).filter(
+-            (t) => !exclude.includes(t.id!),
+-        );
+-
+-        for (const transaction of transactions) {
+-            if (candidateTransactions.length === milestone.block.maxTransactions) {
+-                break;
+-            }
+-
+-            if (failedTransactions.some((t) => t.data.senderId === transaction.data.senderId)) {
+-                continue;
+-            }
+-
+-            try {
+-                if (this.expirationService.isExpired(transaction)) {
+-                    const expirationHeight: number = this.expirationService.getExpirationHeight(transaction);
+-                    throw new TransactionHasExpiredError(transaction, expirationHeight);
+-                }
+-
+-                if (bytesLeft - 4 - transaction.serialised.length < 0) {
++        // Candidates are validated by the rules of the next block, tip + 1; the block budget stays at the tip
++        return Managers.configManager.runAtHeight(height + 1, async () => {
++            const milestone = Managers.configManager.getMilestone(height);
++            const blockHeaderSize =
++                4 + // version
++                4 + // timestamp
++                4 + // height
++                32 + // previousBlockId
++                4 + // numberOfTransactions
++                8 + // totalAmount
++                8 + // totalFee
++                8 + // reward
++                4 + // payloadLength
++                32 + // payloadHash
++                33; // generatorPublicKey
++
++            let bytesLeft: number = milestone.block.maxPayload - blockHeaderSize;
++
++            const candidateTransactions: Interfaces.ITransaction[] = [];
++            const validator: Contracts.State.TransactionValidator = this.createTransactionValidator();
++            const failedTransactions: Interfaces.ITransaction[] = [];
++
++            const transactions: Interfaces.ITransaction[] = Array.from(this.poolQuery.getFromHighestPriority()).filter(
++                (t) => !exclude.includes(t.id!),
++            );
++
++            for (const transaction of transactions) {
++                if (candidateTransactions.length === milestone.block.maxTransactions) {
+                     break;
+                 }
+ 
+-                let candidateTransaction: Interfaces.ITransaction;
+-                if (validate) {
+-                    candidateTransaction = await validator.validate(transaction);
+-                } else {
+-                    candidateTransaction = transaction;
++                if (failedTransactions.some((t) => t.data.senderId === transaction.data.senderId)) {
++                    continue;
+                 }
+-                candidateTransactions.push(candidateTransaction);
+ 
+-                bytesLeft -= 4;
+-                bytesLeft -= candidateTransaction.serialised.length;
+-            } catch (error) {
+-                this.logger.warning(`${transaction} failed to collate: ${error.message} :warning:`);
+-                failedTransactions.push(transaction);
++                try {
++                    if (this.expirationService.isExpired(transaction)) {
++                        const expirationHeight: number = this.expirationService.getExpirationHeight(transaction);
++                        throw new TransactionHasExpiredError(transaction, expirationHeight);
++                    }
++
++                    if (bytesLeft - 4 - transaction.serialised.length < 0) {
++                        break;
++                    }
++
++                    let candidateTransaction: Interfaces.ITransaction;
++                    if (validate) {
++                        candidateTransaction = await validator.validate(transaction);
++                    } else {
++                        candidateTransaction = transaction;
++                    }
++                    candidateTransactions.push(candidateTransaction);
++
++                    bytesLeft -= 4;
++                    bytesLeft -= candidateTransaction.serialised.length;
++                } catch (error) {
++                    this.logger.warning(`${transaction} failed to collate: ${error.message} :warning:`);
++                    failedTransactions.push(transaction);
++                }
+             }
+-        }
+ 
+-        (async () => {
+-            for (const failedTransaction of failedTransactions) {
+-                await this.pool.removeTransaction(failedTransaction);
+-            }
+-        })();
++            (async () => {
++                for (const failedTransaction of failedTransactions) {
++                    await this.pool.removeTransaction(failedTransaction);
++                }
++            })();
+ 
+-        return candidateTransactions;
++            return candidateTransactions;
++        });
+     }
+ }
+diff --git a/packages/pool/src/processor.ts b/packages/pool/src/processor.ts
+index 7e39a3f1e..86c6a1432 100644
+--- a/packages/pool/src/processor.ts
++++ b/packages/pool/src/processor.ts
+@@ -1,4 +1,4 @@
+-import { Interfaces } from "@solar-network/crypto";
++import { Interfaces, Managers } from "@solar-network/crypto";
+ import { Container, Contracts } from "@solar-network/kernel";
+ import delay from "delay";
+ 
+@@ -23,100 +23,106 @@ export class Processor implements Contracts.Pool.Processor {
+     @Container.inject(Container.Identifiers.LogService)
+     private readonly logger!: Contracts.Kernel.Logger;
+ 
++    @Container.inject(Container.Identifiers.StateStore)
++    private readonly stateStore!: Contracts.State.StateStore;
++
+     private cachedTransactions: Map<string, number> = new Map();
+ 
+     public async process(data: Interfaces.ITransactionData[] | Buffer[]): Promise<Contracts.Pool.ProcessorResult> {
+-        const accept: string[] = [];
+-        const broadcast: string[] = [];
+-        const invalid: string[] = [];
+-        const excess: string[] = [];
+-        let errors: { [id: string]: Contracts.Pool.ProcessorError } | undefined = undefined;
+-
+-        const broadcastTransactions: Interfaces.ITransaction[] = [];
+-        const transactions: Interfaces.ITransaction[] = [];
+-        const timeNow: number = Math.ceil(Date.now() / 1000);
+-        const expirySeconds: number = 30;
+-
+-        const handleError = (entryId: string, error: Error) => {
+-            invalid.push(entryId);
+-
+-            if (error instanceof Contracts.Pool.PoolError) {
+-                if (error.type === "ERR_EXCEEDS_MAX_COUNT") {
+-                    excess.push(entryId);
++        // Pool admission judges a transaction by the rules of the next block, tip + 1
++        return Managers.configManager.runAtHeight(this.stateStore.getLastHeight() + 1, async () => {
++            const accept: string[] = [];
++            const broadcast: string[] = [];
++            const invalid: string[] = [];
++            const excess: string[] = [];
++            let errors: { [id: string]: Contracts.Pool.ProcessorError } | undefined = undefined;
++
++            const broadcastTransactions: Interfaces.ITransaction[] = [];
++            const transactions: Interfaces.ITransaction[] = [];
++            const timeNow: number = Math.ceil(Date.now() / 1000);
++            const expirySeconds: number = 30;
++
++            const handleError = (entryId: string, error: Error) => {
++                invalid.push(entryId);
++
++                if (error instanceof Contracts.Pool.PoolError) {
++                    if (error.type === "ERR_EXCEEDS_MAX_COUNT") {
++                        excess.push(entryId);
++                    }
++
++                    if (!errors) errors = {};
++                    errors[entryId] = {
++                        type: error.type,
++                        message: error.message,
++                    };
++                } else {
++                    throw error;
+                 }
++            };
+ 
+-                if (!errors) errors = {};
+-                errors[entryId] = {
+-                    type: error.type,
+-                    message: error.message,
+-                };
+-            } else {
+-                throw error;
++            for (const [id, expiryTime] of this.cachedTransactions.entries()) {
++                if (timeNow - expiryTime >= expirySeconds) {
++                    this.cachedTransactions.delete(id);
++                }
+             }
+-        };
+ 
+-        for (const [id, expiryTime] of this.cachedTransactions.entries()) {
+-            if (timeNow - expiryTime >= expirySeconds) {
+-                this.cachedTransactions.delete(id);
+-            }
+-        }
++            try {
++                for (let i = 0; i < data.length; i++) {
++                    const transactionData = data[i];
++                    const entryId = transactionData instanceof Buffer ? String(i) : transactionData.id ?? String(i);
+ 
+-        try {
+-            for (let i = 0; i < data.length; i++) {
+-                const transactionData = data[i];
+-                const entryId = transactionData instanceof Buffer ? String(i) : transactionData.id ?? String(i);
+-
+-                try {
+-                    const transaction = await this.getTransaction(transactionData);
+-                    if (transaction.id && !this.cachedTransactions.has(transaction.id)) {
+-                        this.cachedTransactions.set(transaction.id, timeNow);
+-                        transactions.push(transaction);
+-                    } else if (transaction.id) {
+-                        throw new AlreadyTriedTransactionError(
+-                            transaction,
+-                            expirySeconds - (timeNow - this.cachedTransactions.get(transaction.id)!),
+-                        );
++                    try {
++                        const transaction = await this.getTransaction(transactionData);
++                        if (transaction.id && !this.cachedTransactions.has(transaction.id)) {
++                            this.cachedTransactions.set(transaction.id, timeNow);
++                            transactions.push(transaction);
++                        } else if (transaction.id) {
++                            throw new AlreadyTriedTransactionError(
++                                transaction,
++                                expirySeconds - (timeNow - this.cachedTransactions.get(transaction.id)!),
++                            );
++                        }
++                    } catch (error) {
++                        handleError(entryId, error);
+                     }
+-                } catch (error) {
+-                    handleError(entryId, error);
++                    await delay(1);
+                 }
+-                await delay(1);
+-            }
+-
+-            for (let i = 0; i < transactions.length; i++) {
+-                const transaction = transactions[i];
+-                const entryId = transaction.data && transaction.data.id ? transaction.data.id : String(i);
+-                try {
+-                    await this.pool.addTransaction(transaction);
+-                    accept.push(entryId);
+ 
++                for (let i = 0; i < transactions.length; i++) {
++                    const transaction = transactions[i];
++                    const entryId = transaction.data && transaction.data.id ? transaction.data.id : String(i);
+                     try {
+-                        await Promise.all(this.extensions.map((e) => e.throwIfCannotBroadcast(transaction)));
+-                        broadcastTransactions.push(transaction);
+-                        broadcast.push(entryId);
+-                    } catch {
+-                        //
++                        await this.pool.addTransaction(transaction);
++                        accept.push(entryId);
++
++                        try {
++                            await Promise.all(this.extensions.map((e) => e.throwIfCannotBroadcast(transaction)));
++                            broadcastTransactions.push(transaction);
++                            broadcast.push(entryId);
++                        } catch {
++                            //
++                        }
++                    } catch (error) {
++                        handleError(entryId, error);
+                     }
+-                } catch (error) {
+-                    handleError(entryId, error);
++                    await delay(1);
++                }
++            } finally {
++                if (this.transactionBroadcaster && broadcastTransactions.length !== 0) {
++                    this.transactionBroadcaster
++                        .broadcastTransactions(broadcastTransactions)
++                        .catch((error) => this.logger.error(error.stack));
+                 }
+-                await delay(1);
+-            }
+-        } finally {
+-            if (this.transactionBroadcaster && broadcastTransactions.length !== 0) {
+-                this.transactionBroadcaster
+-                    .broadcastTransactions(broadcastTransactions)
+-                    .catch((error) => this.logger.error(error.stack));
+             }
+-        }
+ 
+-        return {
+-            accept,
+-            broadcast,
+-            invalid,
+-            excess,
+-            errors,
+-        };
++            return {
++                accept,
++                broadcast,
++                invalid,
++                excess,
++                errors,
++            };
++        });
+     }
+ 
+     private async getTransaction(
+diff --git a/packages/pool/src/service.ts b/packages/pool/src/service.ts
+index f755eb0bd..19d7e7480 100644
+--- a/packages/pool/src/service.ts
++++ b/packages/pool/src/service.ts
+@@ -1,4 +1,4 @@
+-import { Interfaces, Transactions } from "@solar-network/crypto";
++import { Interfaces, Managers, Transactions } from "@solar-network/crypto";
+ import { Container, Contracts, Enums, Providers, Utils as AppUtils } from "@solar-network/kernel";
+ 
+ import { PoolFullError, TransactionAlreadyInPoolError } from "./errors";
+@@ -121,147 +121,154 @@ export class Service implements Contracts.Pool.Service {
+         recheckValidity: boolean = false,
+     ): Promise<void> {
+         await this.lock.runExclusive(async () => {
+-            if (this.disposed) {
+-                return;
+-            }
++            // Re-added transactions are judged by the rules of the next block, tip + 1
++            await Managers.configManager.runAtHeight(this.stateStore.getLastHeight() + 1, async () => {
++                if (this.disposed) {
++                    return;
++                }
+ 
+-            this.mempool.flush();
++                this.mempool.flush();
+ 
+-            let previouslyForgedSuccesses = 0;
+-            let previouslyForgedFailures = 0;
+-            let previouslyStoredSuccesses = 0;
+-            let previouslyStoredExpirations = 0;
+-            let previouslyStoredFailures = 0;
++                let previouslyForgedSuccesses = 0;
++                let previouslyForgedFailures = 0;
++                let previouslyStoredSuccesses = 0;
++                let previouslyStoredExpirations = 0;
++                let previouslyStoredFailures = 0;
+ 
+-            const previouslyForgedStoredIds: string[] = [];
++                const previouslyForgedStoredIds: string[] = [];
+ 
+-            for (const { addresses, id, serialised } of previouslyForgedTransactions) {
+-                try {
+-                    const previouslyForgedTransaction = Transactions.TransactionFactory.fromBytesUnsafe(
+-                        serialised,
+-                        id,
+-                        addresses,
+-                    );
++                for (const { addresses, id, serialised } of previouslyForgedTransactions) {
++                    try {
++                        const previouslyForgedTransaction = Transactions.TransactionFactory.fromBytesUnsafe(
++                            serialised,
++                            id,
++                            addresses,
++                        );
+ 
+-                    AppUtils.assert.defined<string>(previouslyForgedTransaction.id);
+-                    AppUtils.assert.defined<string>(previouslyForgedTransaction.data.senderId);
++                        AppUtils.assert.defined<string>(previouslyForgedTransaction.id);
++                        AppUtils.assert.defined<string>(previouslyForgedTransaction.data.senderId);
+ 
+-                    await this.addTransactionToMempool(previouslyForgedTransaction);
++                        await this.addTransactionToMempool(previouslyForgedTransaction);
+ 
+-                    this.storage.addTransaction({
+-                        height: this.stateStore.getLastHeight(),
+-                        id: previouslyForgedTransaction.id,
+-                        recipientId: (previouslyForgedTransaction.addresses.recipientId || []).join(","),
+-                        senderId: previouslyForgedTransaction.data.senderId,
+-                        serialised: previouslyForgedTransaction.serialised,
+-                    });
++                        this.storage.addTransaction({
++                            height: this.stateStore.getLastHeight(),
++                            id: previouslyForgedTransaction.id,
++                            recipientId: (previouslyForgedTransaction.addresses.recipientId || []).join(","),
++                            senderId: previouslyForgedTransaction.data.senderId,
++                            serialised: previouslyForgedTransaction.serialised,
++                        });
+ 
+-                    previouslyForgedStoredIds.push(previouslyForgedTransaction.id);
++                        previouslyForgedStoredIds.push(previouslyForgedTransaction.id);
+ 
+-                    previouslyForgedSuccesses++;
+-                } catch (error) {
+-                    this.logger.debug(
+-                        `Failed to re-add previously forged transaction ${id} to the pool: ${error.message} :warning:`,
+-                    );
+-                    previouslyForgedFailures++;
++                        previouslyForgedSuccesses++;
++                    } catch (error) {
++                        this.logger.debug(
++                            `Failed to re-add previously forged transaction ${id} to the pool: ${error.message} :warning:`,
++                        );
++                        previouslyForgedFailures++;
++                    }
+                 }
+-            }
+-
+-            const maxTransactionAge: number = this.configuration.getRequired<number>("maxTransactionAge");
+-            const lastHeight: number = this.stateStore.getLastHeight();
+-            const expiredHeight: number = lastHeight - maxTransactionAge;
+ 
+-            for (const { height, id, recipientId, senderId, serialised } of this.storage.getAllTransactions()) {
+-                if (previouslyForgedStoredIds.includes(id)) {
+-                    continue;
+-                }
++                const maxTransactionAge: number = this.configuration.getRequired<number>("maxTransactionAge");
++                const lastHeight: number = this.stateStore.getLastHeight();
++                const expiredHeight: number = lastHeight - maxTransactionAge;
+ 
+-                if (height > expiredHeight) {
+-                    try {
+-                        const addresses: Interfaces.IDeserialiseAddresses = {
+-                            senderId,
+-                            recipientId: (recipientId || "").split(","),
+-                        };
+-                        if (addresses.recipientId![0].length === 0) {
+-                            delete addresses.recipientId;
+-                        }
++                for (const { height, id, recipientId, senderId, serialised } of this.storage.getAllTransactions()) {
++                    if (previouslyForgedStoredIds.includes(id)) {
++                        continue;
++                    }
+ 
+-                        const previouslyStoredTransaction = Transactions.TransactionFactory.fromBytesUnsafe(
+-                            serialised,
+-                            id,
+-                            addresses,
+-                        );
+-                        await this.addTransactionToMempool(previouslyStoredTransaction);
+-                        previouslyStoredSuccesses++;
+-                    } catch (error) {
+-                        this.storage.removeTransaction(id);
+-                        if (!recheckValidity) {
+-                            this.logger.debug(
+-                                `Failed to re-add previously stored transaction ${id} to the pool: ${error.message} :warning:`,
++                    if (height > expiredHeight) {
++                        try {
++                            const addresses: Interfaces.IDeserialiseAddresses = {
++                                senderId,
++                                recipientId: (recipientId || "").split(","),
++                            };
++                            if (addresses.recipientId![0].length === 0) {
++                                delete addresses.recipientId;
++                            }
++
++                            const previouslyStoredTransaction = Transactions.TransactionFactory.fromBytesUnsafe(
++                                serialised,
++                                id,
++                                addresses,
+                             );
++                            await this.addTransactionToMempool(previouslyStoredTransaction);
++                            previouslyStoredSuccesses++;
++                        } catch (error) {
++                            this.storage.removeTransaction(id);
++                            if (!recheckValidity) {
++                                this.logger.debug(
++                                    `Failed to re-add previously stored transaction ${id} to the pool: ${error.message} :warning:`,
++                                );
++                            }
++                            previouslyStoredFailures++;
+                         }
+-                        previouslyStoredFailures++;
++                    } else {
++                        this.storage.removeTransaction(id);
++                        this.logger.debug(`Not re-adding previously stored expired transaction to the pool: ${id}`);
++                        previouslyStoredExpirations++;
+                     }
+-                } else {
+-                    this.storage.removeTransaction(id);
+-                    this.logger.debug(`Not re-adding previously stored expired transaction to the pool: ${id}`);
+-                    previouslyStoredExpirations++;
+                 }
+-            }
+ 
+-            if (!recheckValidity && previouslyForgedSuccesses >= 1) {
+-                this.logger.info(
+-                    `${AppUtils.pluralise(
+-                        "previously forged transaction",
+-                        previouslyForgedSuccesses,
+-                        true,
+-                    )} re-added to the pool :money_with_wings:`,
+-                );
+-            }
+-            if (previouslyForgedFailures >= 1) {
+-                this.logger.warning(
+-                    `${AppUtils.pluralise(
+-                        "previously forged transaction",
+-                        previouslyForgedFailures,
+-                        true,
+-                    )} could not be re-added to the pool :warning:`,
+-                );
+-            }
+-            if (!recheckValidity && previouslyStoredSuccesses >= 1) {
+-                this.logger.info(
+-                    `${AppUtils.pluralise(
+-                        "previously stored transaction",
+-                        previouslyStoredSuccesses,
+-                        true,
+-                    )} re-added to the pool :money_with_wings:`,
+-                );
+-            }
+-            if (previouslyStoredExpirations >= 1) {
+-                this.logger.info(
+-                    `${AppUtils.pluralise("transaction", previouslyStoredExpirations, true)} in the pool expired :zap:`,
+-                );
+-            }
+-            if (previouslyStoredFailures >= 1) {
+-                if (recheckValidity) {
+-                    this.logger.warning(
++                if (!recheckValidity && previouslyForgedSuccesses >= 1) {
++                    this.logger.info(
+                         `${AppUtils.pluralise(
+-                            "transaction",
+-                            previouslyStoredFailures,
++                            "previously forged transaction",
++                            previouslyForgedSuccesses,
+                             true,
+-                        )} removed from the pool as ${
+-                            previouslyStoredFailures !== 1 ? "they are" : "it is"
+-                        } no longer valid :zap:`,
++                        )} re-added to the pool :money_with_wings:`,
+                     );
+-                } else {
++                }
++                if (previouslyForgedFailures >= 1) {
+                     this.logger.warning(
+                         `${AppUtils.pluralise(
+-                            "previously stored transaction",
+-                            previouslyStoredFailures,
++                            "previously forged transaction",
++                            previouslyForgedFailures,
+                             true,
+                         )} could not be re-added to the pool :warning:`,
+                     );
+                 }
+-            }
++                if (!recheckValidity && previouslyStoredSuccesses >= 1) {
++                    this.logger.info(
++                        `${AppUtils.pluralise(
++                            "previously stored transaction",
++                            previouslyStoredSuccesses,
++                            true,
++                        )} re-added to the pool :money_with_wings:`,
++                    );
++                }
++                if (previouslyStoredExpirations >= 1) {
++                    this.logger.info(
++                        `${AppUtils.pluralise(
++                            "transaction",
++                            previouslyStoredExpirations,
++                            true,
++                        )} in the pool expired :zap:`,
++                    );
++                }
++                if (previouslyStoredFailures >= 1) {
++                    if (recheckValidity) {
++                        this.logger.warning(
++                            `${AppUtils.pluralise(
++                                "transaction",
++                                previouslyStoredFailures,
++                                true,
++                            )} removed from the pool as ${
++                                previouslyStoredFailures !== 1 ? "they are" : "it is"
++                            } no longer valid :zap:`,
++                        );
++                    } else {
++                        this.logger.warning(
++                            `${AppUtils.pluralise(
++                                "previously stored transaction",
++                                previouslyStoredFailures,
++                                true,
++                            )} could not be re-added to the pool :warning:`,
++                        );
++                    }
++                }
++            });
+         });
+     }
+ 
+diff --git a/packages/state/src/block-state.ts b/packages/state/src/block-state.ts
+index 7f7f9ad32..5aee46ccc 100644
+--- a/packages/state/src/block-state.ts
++++ b/packages/state/src/block-state.ts
+@@ -1,4 +1,4 @@
+-import { Enums, Identities, Interfaces, Utils } from "@solar-network/crypto";
++import { Enums, Identities, Interfaces, Managers, Utils } from "@solar-network/crypto";
+ import { Repositories } from "@solar-network/database";
+ import { Container, Contracts, Utils as AppUtils } from "@solar-network/kernel";
+ import { Handlers } from "@solar-network/transactions";
+@@ -30,58 +30,64 @@ export class BlockState implements Contracts.State.BlockState {
+             index: number | undefined;
+         },
+     ): Promise<void> {
+-        let forgerWallet: Contracts.State.Wallet;
++        // The transaction rules of block H, and any revert when it fails, read the milestone at H
++        return Managers.configManager.runAtHeight(block.data.height, async () => {
++            let forgerWallet: Contracts.State.Wallet;
+ 
+-        if (block.data.height === 1) {
+-            this.initGenesisForgerWallet(block.data.generatorPublicKey);
+-            forgerWallet = this.walletRepository.findByPublicKey(block.data.generatorPublicKey);
+-        } else {
+-            forgerWallet = this.walletRepository.findByUsername(block.data.username!);
+-        }
++            if (block.data.height === 1) {
++                this.initGenesisForgerWallet(block.data.generatorPublicKey);
++                forgerWallet = this.walletRepository.findByPublicKey(block.data.generatorPublicKey);
++            } else {
++                forgerWallet = this.walletRepository.findByUsername(block.data.username!);
++            }
+ 
+-        const previousBlock = this.state.getLastBlock();
++            const previousBlock = this.state.getLastBlock();
+ 
+-        const appliedTransactions: Interfaces.ITransaction[] = [];
+-        try {
+-            for (const transaction of block.transactions) {
+-                transactionProcessing.index = appliedTransactions.length;
+-                await this.applyTransaction(block.data.height, transaction);
+-                transactionProcessing.index = undefined;
+-                appliedTransactions.push(transaction);
+-            }
+-            this.applyBlockToForger(forgerWallet, block);
++            const appliedTransactions: Interfaces.ITransaction[] = [];
++            try {
++                for (const transaction of block.transactions) {
++                    transactionProcessing.index = appliedTransactions.length;
++                    await this.applyTransaction(block.data.height, transaction);
++                    transactionProcessing.index = undefined;
++                    appliedTransactions.push(transaction);
++                }
++                this.applyBlockToForger(forgerWallet, block);
+ 
+-            this.state.setLastBlock(block);
+-        } catch (error) {
+-            for (const transaction of appliedTransactions.reverse()) {
+-                await this.revertTransaction(block.data.height, transaction);
+-            }
++                this.state.setLastBlock(block);
++            } catch (error) {
++                for (const transaction of appliedTransactions.reverse()) {
++                    await this.revertTransaction(block.data.height, transaction);
++                }
+ 
+-            this.state.setLastBlock(previousBlock);
++                this.state.setLastBlock(previousBlock);
+ 
+-            throw error;
+-        }
++                throw error;
++            }
++        });
+     }
+ 
+     public async revertBlock(block: Interfaces.IBlock): Promise<void> {
+-        const forgerWallet = this.walletRepository.findByUsername(block.data.username!);
+-
+-        const revertedTransactions: Interfaces.ITransaction[] = [];
+-        try {
+-            await this.revertBlockFromForger(forgerWallet, block);
+-
+-            for (const transaction of block.transactions.slice().reverse()) {
+-                await this.revertTransaction(block.data.height, transaction);
+-                revertedTransactions.push(transaction);
+-            }
+-        } catch (error) {
+-            this.logger.error(error.stack);
+-            this.logger.error("Failed to revert all transactions in block - applying previous transactions");
+-            for (const transaction of revertedTransactions.reverse()) {
+-                await this.applyTransaction(block.data.height, transaction);
++        // Reverting block H reads the milestone at H
++        return Managers.configManager.runAtHeight(block.data.height, async () => {
++            const forgerWallet = this.walletRepository.findByUsername(block.data.username!);
++
++            const revertedTransactions: Interfaces.ITransaction[] = [];
++            try {
++                await this.revertBlockFromForger(forgerWallet, block);
++
++                for (const transaction of block.transactions.slice().reverse()) {
++                    await this.revertTransaction(block.data.height, transaction);
++                    revertedTransactions.push(transaction);
++                }
++            } catch (error) {
++                this.logger.error(error.stack);
++                this.logger.error("Failed to revert all transactions in block - applying previous transactions");
++                for (const transaction of revertedTransactions.reverse()) {
++                    await this.applyTransaction(block.data.height, transaction);
++                }
++                throw error;
+             }
+-            throw error;
+-        }
++        });
+     }
+ 
+     public async applyTransaction(height: number, transaction: Interfaces.ITransaction): Promise<void> {
+diff --git a/patches/tests/25-rule-height-block.test.js b/patches/tests/25-rule-height-block.test.js
+new file mode 100644
+index 000000000..c4b83314b
+--- /dev/null
++++ b/patches/tests/25-rule-height-block.test.js
+@@ -0,0 +1,341 @@
++"use strict";
++
++// Patch 25 rule-height-block.
++// Transaction-level rules of block H (decode, schema, apply, revert) read the milestone at H; pool admission,
++// pool re-adds and the collator's validation read it at tip + 1. ConfigManager.runAtHeight(h, fn) scopes the
++// height along fn's own async chain; getHeight() and getMilestone() without a height honour it.
++// The milestone file drops transfer.maximum from 256 to 2 at height 10; T is a transfer with 3 recipients.
++// Usage: SOLAR_DIR=<built Solar checkout> node patches/tests/25-rule-height-block.test.js
++
++const path = require("path");
++
++const SOLAR_DIR = process.env.SOLAR_DIR || path.resolve(__dirname, "../..");
++const { Blocks, Crypto, Identities, Managers, Transactions, Utils } = require(path.join(
++    SOLAR_DIR,
++    "packages/crypto/dist",
++));
++
++let passed = 0;
++let failed = 0;
++const check = async (name, fn) => {
++    try {
++        const detail = await fn();
++        if (detail === true) {
++            passed++;
++            console.log(`PASS ${name}`);
++        } else {
++            failed++;
++            console.log(`FAIL ${name}: ${detail}`);
++        }
++    } catch (error) {
++        failed++;
++        console.log(`FAIL ${name}: ${error.message.split("\n")[0]}`);
++    }
++};
++
++const network = {
++    name: "devnet",
++    messagePrefix: "Solar devnet message:\n",
++    addressCharacter: "d",
++    bip32: { public: 70617039, private: 70615956 },
++    pubKeyHash: 90,
++    nethash: "c9b03ab996ef3ac216a2ac53eaee71118cbf7995fa44449a7fb7f94bbe18bcca",
++    wif: 252,
++    slip44: 1,
++    client: { token: "dROOT", symbol: "dRT", explorer: "" },
++};
++
++const cm = Managers.configManager;
++cm.setConfig({
++    network,
++    milestones: [
++        {
++            height: 1,
++            activeDelegates: 53,
++            block: { version: 0, maxTransactions: 150, maxPayload: 2097152 },
++            blocksToRevokeDelegateResignation: 106,
++            blockTime: 8,
++            burn: { feeBasisPoints: 9000, txAmount: 2000000 },
++            epoch: "2026-09-25T20:05:04.000Z",
++            fees: { staticFees: { transfer: 50000000 } },
++            legacyTransfer: false,
++            legacyVote: false,
++            p2p: { minimumVersions: [">=4.3.0"] },
++            transfer: { maximum: 256, minimum: 1 },
++            reward: 0,
++            bip340: true,
++            acceptLegacySchnorrTransactions: false,
++            donations: {},
++        },
++        { height: 10, transfer: { maximum: 2, minimum: 1 } },
++    ],
++    exceptions: {},
++    genesisBlock: { transactions: [] },
++});
++
++const runAtHeight = (height, fn) => {
++    if (typeof cm.runAtHeight !== "function") {
++        throw new Error("configManager.runAtHeight does not exist");
++    }
++    return cm.runAtHeight(height, fn);
++};
++
++cm.setHeight(1);
++const RECIPIENTS = ["dZDbtMv86KMqo8iPMtAJLhoT5BVKfyVokA", "dPiLD2Fi1dnQhnskBkSnDEPraaWtbTcYPj", "dZDbtMv86KMqo8iPMtAJLhoT5BVKfyVokA"];
++const builder = Transactions.BuilderFactory.transfer().fee("50000000").nonce("1");
++for (const recipient of RECIPIENTS) {
++    builder.addTransfer(recipient, "100");
++}
++const T = builder.sign("patch 25 test sender").build();
++
++const accepts = (fn) => {
++    try {
++        fn();
++        return "accepted";
++    } catch (error) {
++        return `rejected (${error.constructor.name})`;
++    }
++};
++
++// A block at `height` holding T, built by hand so that no milestone rule is applied while building it.
++const FORGER = Identities.Keys.fromPassphrase("patch 25 test forger");
++const blockJson = (height) => {
++    const transaction = Transactions.TransactionFactory.fromBytesUnsafe(T.serialised, T.id);
++    const data = {
++        version: 0,
++        timestamp: height * 8,
++        height,
++        previousBlock: "ab".repeat(32),
++        numberOfTransactions: 1,
++        totalAmount: Utils.BigNumber.make(300),
++        totalFee: Utils.BigNumber.make(50000000),
++        reward: Utils.BigNumber.ZERO,
++        payloadLength: 32,
++        payloadHash: Crypto.HashAlgorithms.sha256(Buffer.from(T.id, "hex")).toString("hex"),
++        generatorPublicKey: FORGER.publicKey.secp256k1,
++        transactions: [transaction.data],
++    };
++    const hash = Crypto.HashAlgorithms.sha256(Blocks.Serialiser.serialise(data, false));
++    data.blockSignature = Crypto.Hash.signSchnorr(hash, FORGER, true, Buffer.alloc(32, 1));
++    data.id = Blocks.Block.getId(data);
++    const json = JSON.parse(
++        JSON.stringify({ ...data, transactions: undefined }, (key, value) =>
++            value instanceof Utils.BigNumber ? value.toString() : value,
++        ),
++    );
++    json.transactions = [transaction.toJson()];
++    return { json, bytes: Blocks.Serialiser.serialiseWithTransactions(data) };
++};
++
++const milestoneHeight = () => cm.getMilestone().height;
++
++const main = async () => {
++    await check("T is valid at height 9 and invalid at height 10 through runAtHeight", () => {
++        cm.setHeight(1);
++        const at9 = runAtHeight(9, () => accepts(() => Transactions.TransactionFactory.fromBytes(T.serialised)));
++        const at10 = runAtHeight(10, () => accepts(() => Transactions.TransactionFactory.fromBytes(T.serialised)));
++        return (at9 === "accepted" && at10.startsWith("rejected")) || `height 9 ${at9}, height 10 ${at10}`;
++    });
++
++    await check("outside a scope getHeight() and getMilestone() still use the global height", () => {
++        cm.setHeight(10);
++        const inside = runAtHeight(9, () => `${cm.getHeight()}/${milestoneHeight()}`);
++        const outside = `${cm.getHeight()}/${milestoneHeight()}`;
++        const explicit = runAtHeight(10, () => cm.getMilestone(5).height);
++        return (inside === "9/1" && outside === "10/10" && explicit === 1) || `inside ${inside}, outside ${outside}, explicit ${explicit}`;
++    });
++
++    const block10 = blockJson(10);
++    const block9 = blockJson(9);
++
++    await check("global height 9: block 10 holding T is rejected by BlockFactory.fromBytes", () => {
++        cm.setHeight(9);
++        const verdict = accepts(() => Blocks.BlockFactory.fromBytes(block10.bytes));
++        return verdict.startsWith("rejected") || verdict;
++    });
++
++    await check("global height 9: block 10 holding T is rejected by BlockFactory.fromData", () => {
++        cm.setHeight(9);
++        const verdict = accepts(() => Blocks.BlockFactory.fromJson(JSON.parse(JSON.stringify(block10.json))));
++        return verdict.startsWith("rejected") || verdict;
++    });
++
++    await check("global height 10: block 9 holding T is accepted by BlockFactory.fromBytes (sync case)", () => {
++        cm.setHeight(10);
++        const verdict = accepts(() => Blocks.BlockFactory.fromBytes(block9.bytes));
++        return verdict === "accepted" || verdict;
++    });
++
++    await check("global height 10: block 9 holding T is accepted by BlockFactory.fromData (sync case)", () => {
++        cm.setHeight(10);
++        const verdict = accepts(() => Blocks.BlockFactory.fromJson(JSON.parse(JSON.stringify(block9.json))));
++        return verdict === "accepted" || verdict;
++    });
++
++    // BlockState, with stubs for everything it reads.
++    const { BlockState } = require(path.join(SOLAR_DIR, "packages/state/dist/block-state"));
++    const stubBlockState = (seen) => {
++        const wallet = { getAttribute: () => ({}) };
++        const handler = {
++            apply: async () => seen.push(`apply:${milestoneHeight()}`),
++            revert: async () => seen.push(`revert:${milestoneHeight()}`),
++        };
++        const blockState = Object.create(BlockState.prototype);
++        Object.assign(blockState, {
++            handlerRegistry: { getActivatedHandlerForData: async () => handler },
++            walletRepository: { findByUsername: () => wallet, findByAddress: () => wallet, findByPublicKey: () => wallet },
++            state: {
++                getLastBlock: () => ({ data: { height: 9 } }),
++                setLastBlock: () => seen.push(`setLastBlock:${milestoneHeight()}`),
++            },
++            logger: { error: () => undefined },
++            applyBlockToForger: () => seen.push(`forger:${milestoneHeight()}`),
++            revertBlockFromForger: async () => seen.push(`unforger:${milestoneHeight()}`),
++            updateVoteBalances: () => undefined,
++        });
++        return blockState;
++    };
++    const stubBlock = () => ({
++        data: { height: 10, username: "genesis_1" },
++        transactions: [{ type: 6, typeGroup: 1, data: { senderId: RECIPIENTS[0] }, setBurnedFee: () => undefined }],
++    });
++
++    await check("BlockState.applyBlock(10) at global height 9: the handler sees the height-10 milestone", async () => {
++        cm.setHeight(9);
++        const seen = [];
++        await stubBlockState(seen).applyBlock(stubBlock(), { index: undefined });
++        const got = seen.join(",");
++        return got === "apply:10,forger:10,setLastBlock:10" || `saw ${got}`;
++    });
++
++    await check("BlockState.revertBlock(10) at global height 9: the handler sees the height-10 milestone", async () => {
++        cm.setHeight(9);
++        const seen = [];
++        await stubBlockState(seen).revertBlock(stubBlock());
++        const got = seen.join(",");
++        return got === "unforger:10,revert:10" || `saw ${got}`;
++    });
++
++    await check("BlockState.applyBlock(10): the revert after a failed transaction also sees height 10", async () => {
++        cm.setHeight(9);
++        const seen = [];
++        const blockState = stubBlockState(seen);
++        const block = stubBlock();
++        block.transactions.push({
++            type: 6,
++            typeGroup: 1,
++            data: { senderId: RECIPIENTS[0] },
++            setBurnedFee: () => {
++                throw new Error("second transaction fails");
++            },
++        });
++        try {
++            await blockState.applyBlock(block, { index: undefined });
++            return "applyBlock did not throw";
++        } catch {
++            const got = seen.join(",");
++            return got === "apply:10,revert:10,setLastBlock:10" || `saw ${got}`;
++        }
++    });
++
++    // Pool: processor, collator and re-adds at tip 9 judge by height 10.
++    const { Processor } = require(path.join(SOLAR_DIR, "packages/pool/dist/processor"));
++    const { Collator } = require(path.join(SOLAR_DIR, "packages/pool/dist/collator"));
++    const { Service } = require(path.join(SOLAR_DIR, "packages/pool/dist/service"));
++    const { Utils: AppUtils } = require(path.join(SOLAR_DIR, "packages/kernel/dist"));
++
++    await check("Processor.process at tip 9: the worker and the pool see height 10", async () => {
++        cm.setHeight(9);
++        const seen = [];
++        const processor = Object.create(Processor.prototype);
++        Object.assign(processor, {
++            extensions: [],
++            pool: { addTransaction: async () => seen.push(`pool:${milestoneHeight()}`) },
++            workerPool: {
++                getTransaction: async () => {
++                    seen.push(`worker:${cm.getHeight()}/${milestoneHeight()}`);
++                    return T;
++                },
++            },
++            transactionBroadcaster: undefined,
++            logger: { error: () => undefined },
++            stateStore: { getLastHeight: () => 9 },
++            cachedTransactions: new Map(),
++        });
++        const result = await processor.process([T.serialised]);
++        const got = seen.join(",");
++        return (got === "worker:10/10,pool:10" && result.accept.length === 1) || `saw ${got}, accepted ${result.accept.length}`;
++    });
++
++    await check("Collator.getBlockCandidateTransactions at tip 9: validation sees height 10", async () => {
++        cm.setHeight(9);
++        const seen = [];
++        const collator = Object.create(Collator.prototype);
++        Object.assign(collator, {
++            createTransactionValidator: () => ({
++                validate: async (transaction) => {
++                    seen.push(`validate:${milestoneHeight()}`);
++                    return transaction;
++                },
++            }),
++            blockchain: { getLastBlock: () => ({ data: { height: 9 } }) },
++            pool: { removeTransaction: async () => undefined },
++            expirationService: { isExpired: () => false },
++            poolQuery: { getFromHighestPriority: () => [T] },
++            logger: { warning: () => undefined },
++        });
++        const candidates = await collator.getBlockCandidateTransactions(true, []);
++        const got = seen.join(",");
++        return (got === "validate:10" && candidates.length === 1) || `saw ${got}, ${candidates.length} candidates`;
++    });
++
++    await check("Service.readdTransactions at tip 9: re-added transactions see height 10", async () => {
++        cm.setHeight(9);
++        const seen = [];
++        const service = Object.create(Service.prototype);
++        Object.assign(service, {
++            lock: new AppUtils.Lock(),
++            disposed: false,
++            mempool: { flush: () => undefined },
++            storage: {
++                getAllTransactions: () => [
++                    { height: 9, id: T.id, recipientId: "", senderId: T.data.senderId, serialised: T.serialised },
++                ],
++                removeTransaction: () => undefined,
++                addTransaction: () => undefined,
++            },
++            configuration: { getRequired: () => 2700 },
++            stateStore: { getLastHeight: () => 9 },
++            logger: { debug: () => undefined, info: () => undefined, warning: () => undefined },
++            addTransactionToMempool: async () => seen.push(`readd:${milestoneHeight()}`),
++        });
++        await service.readdTransactions();
++        const got = seen.join(",");
++        return got === "readd:10" || `saw ${got}`;
++    });
++
++    await check("two concurrent scopes stay isolated", async () => {
++        cm.setHeight(9);
++        const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
++        const observe = (height, pause) =>
++            runAtHeight(height, async () => {
++                const seen = [];
++                for (let i = 0; i < 4; i++) {
++                    await sleep(pause);
++                    seen.push(`${cm.getHeight()}/${milestoneHeight()}`);
++                }
++                return seen.join(" ");
++            });
++        const [a, b] = await Promise.all([observe(9, 3), observe(10, 2)]);
++        const after = `${cm.getHeight()}/${milestoneHeight()}`;
++        return (a === "9/1 9/1 9/1 9/1" && b === "10/10 10/10 10/10 10/10" && after === "9/1") || `scope 9: ${a}; scope 10: ${b}; after: ${after}`;
++    });
++
++    console.log(`SUMMARY 25-rule-height-block: ${passed} passed, ${failed} failed`);
++    process.exit(failed === 0 ? 0 : 1);
++};
++
++main().catch((error) => {
++    console.log(`FAIL test harness: ${error.stack}`);
++    process.exit(1);
++});
+-- 
+2.43.0
+

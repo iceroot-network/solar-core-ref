@@ -1,7 +1,10 @@
+import { AsyncLocalStorage } from "async_hooks";
+import { base58 } from "bstring";
 import deepmerge from "deepmerge";
 import get from "lodash.get";
 import set from "lodash.set";
 
+import { HashAlgorithms } from "../crypto/hash-algorithms";
 import { InvalidMilestoneConfigurationError } from "../errors";
 import { IMilestone } from "../interfaces";
 import { NetworkConfig } from "../interfaces/networks";
@@ -19,6 +22,7 @@ export class ConfigManager {
     private height: number | undefined;
     private milestone: IMilestone | undefined;
     private milestones: Record<string, any> | undefined;
+    private readonly ruleHeight = new AsyncLocalStorage<number>();
 
     public constructor() {
         this.setConfig(networks.testnet as unknown as NetworkConfig);
@@ -34,6 +38,7 @@ export class ConfigManager {
 
         this.validateMilestones();
         this.buildConstants();
+        this.validateMergedMilestones();
     }
 
     public setFromPreset(network: NetworkName): void {
@@ -65,7 +70,13 @@ export class ConfigManager {
     }
 
     public getHeight(): number | undefined {
-        return this.height;
+        return this.ruleHeight.getStore() ?? this.height;
+    }
+
+    // Runs fn with a scoped height that getHeight() and getMilestone() honour, along fn's own async chain only.
+    // Transaction rules of block H read the milestone at H; the pool reads it at tip + 1
+    public runAtHeight<T>(height: number, fn: () => T): T {
+        return this.ruleHeight.run(height, fn);
     }
 
     public isNewMilestone(height?: number): boolean {
@@ -83,8 +94,9 @@ export class ConfigManager {
             throw new Error();
         }
 
-        if (!height && this.height) {
-            height = this.height;
+        const currentHeight = this.getHeight();
+        if (!height && currentHeight) {
+            height = currentHeight;
         }
 
         if (!height) {
@@ -152,10 +164,30 @@ export class ConfigManager {
         let lastMerged = 0;
 
         const overwriteMerge = (dest, source, options) => source;
+        // A deep copy of JSON data that keeps every own key
+        const copy = (value: any): any =>
+            Array.isArray(value)
+                ? value.map(copy)
+                : typeof value === "object" && value !== null
+                ? Object.fromEntries(Object.entries(value).map(([key, item]) => [key, copy(item)]))
+                : value;
+        // Objects merge key by key and arrays are overwritten, with no replace rule at any depth below
+        const plainMerge = (dest: any, source: any) => deepmerge(dest, source, { arrayMerge: overwriteMerge });
+        // A later milestone replaces dynamicReward.ranks and the top-level donations whole, with a copy, so a
+        // merged milestone never shares an object with the raw configuration
+        const replaceMerge = (dest: any, source: any) => copy(source);
+        const dynamicRewardMerge = (dest: any, source: any) =>
+            deepmerge(dest, source, {
+                arrayMerge: overwriteMerge,
+                customMerge: (key: string) => (key === "ranks" ? replaceMerge : plainMerge),
+            });
+        const milestoneMerge = (key: string) =>
+            key === "donations" ? replaceMerge : key === "dynamicReward" ? dynamicRewardMerge : plainMerge;
 
         while (lastMerged < this.milestones.length - 1) {
             this.milestones[lastMerged + 1] = deepmerge(this.milestones[lastMerged], this.milestones[lastMerged + 1], {
                 arrayMerge: overwriteMerge,
+                customMerge: milestoneMerge,
             });
             lastMerged++;
         }
@@ -183,6 +215,155 @@ export class ConfigManager {
                     `Bad milestone at height: ${current.height}. The number of delegates can only be changed at the beginning of a new round`,
                 );
             }
+        }
+    }
+
+    // Start-up checks on the merged milestones: a bad file refuses to start instead of halting the chain
+    private validateMergedMilestones(): void {
+        if (!this.config || !this.milestones) {
+            throw new Error();
+        }
+
+        // The block time and the number of active delegates are fixed from height 1: the multi-span machinery is
+        // removed, so every merged milestone must keep the first milestone's values
+        const first = this.getMilestones()[0] ?? { height: 1 };
+        for (const key of ["blockTime", "activeDelegates"]) {
+            if (!Number.isSafeInteger(first[key]) || first[key] < 1) {
+                throw new InvalidMilestoneConfigurationError(
+                    `Bad milestone at height: ${first.height}. ${key} must be a positive integer`,
+                );
+            }
+        }
+
+        for (const milestone of this.getMilestones()) {
+            const fail = (message: string): never => {
+                throw new InvalidMilestoneConfigurationError(
+                    `Bad milestone at height: ${milestone.height}. ${message}`,
+                );
+            };
+
+            for (const key of ["blockTime", "activeDelegates"]) {
+                if (milestone[key] !== first[key]) {
+                    const value: string = JSON.stringify(milestone[key]);
+                    fail(`${key} is ${value}, but it is ${first[key]} at height ${first.height} and cannot change`);
+                }
+            }
+
+            const burn = milestone.burn;
+            if (typeof burn !== "object" || burn === null || Array.isArray(burn)) {
+                fail("burn must be an object with feeBasisPoints (9000 = 90%)");
+            }
+            if (Object.prototype.hasOwnProperty.call(burn, "feePercent")) {
+                fail("burn.feePercent is not supported: the fee burn is set by burn.feeBasisPoints (9000 = 90%)");
+            }
+            if (!Number.isSafeInteger(burn.feeBasisPoints) || burn.feeBasisPoints < 0 || burn.feeBasisPoints > 10000) {
+                fail("burn.feeBasisPoints must be an integer from 0 to 10000");
+            }
+            // A text or missing value would silently turn the burn transaction off: its handler checks the type
+            if (!Number.isSafeInteger(burn.txAmount) || burn.txAmount < 0) {
+                fail("burn.txAmount, the minimum burn amount in base units, must be a non-negative integer");
+            }
+
+            if (Object.prototype.hasOwnProperty.call(milestone, "donations")) {
+                const donations = milestone.donations;
+                if (typeof donations !== "object" || donations === null || Array.isArray(donations)) {
+                    fail("donations must be an object that maps each address to { basisPoints, purpose }");
+                }
+
+                let sum = 0;
+                for (const [address, donation] of Object.entries<any>(donations)) {
+                    if (!this.isNetworkAddress(address)) {
+                        fail(`donations: ${address} is not a valid address of this network`);
+                    }
+                    if (typeof donation !== "object" || donation === null || Array.isArray(donation)) {
+                        fail(`donations.${address} must be an object with basisPoints`);
+                    }
+                    for (const key of Object.keys(donation)) {
+                        if (key !== "basisPoints" && key !== "purpose") {
+                            fail(
+                                `donations.${address}.${key} is not allowed: a share is set by basisPoints (500 = 5%)`,
+                            );
+                        }
+                    }
+                    if (
+                        !Number.isSafeInteger(donation.basisPoints) ||
+                        donation.basisPoints < 1 ||
+                        donation.basisPoints > 10000
+                    ) {
+                        fail(`donations.${address}.basisPoints must be an integer from 1 to 10000`);
+                    }
+                    if (donation.purpose !== undefined && typeof donation.purpose !== "string") {
+                        fail(`donations.${address}.purpose must be a string`);
+                    }
+                    sum += donation.basisPoints;
+                }
+
+                if (sum > 10000) {
+                    fail(`donations add up to ${sum} basis points, over 10000`);
+                }
+            }
+
+            // An enabled rank table pays every active rank, so a missing or bad reward cannot halt the chain
+            const dynamicReward = milestone.dynamicReward;
+            if (dynamicReward && dynamicReward.enabled) {
+                const activeDelegates = milestone.activeDelegates;
+                if (!Number.isSafeInteger(activeDelegates) || activeDelegates < 1) {
+                    fail("activeDelegates must be a positive integer when dynamicReward is enabled");
+                }
+
+                const ranks = dynamicReward.ranks;
+                if (typeof ranks !== "object" || ranks === null || Array.isArray(ranks)) {
+                    fail(
+                        `dynamicReward.ranks must be an object with a reward for every rank from 1 to ${activeDelegates}`,
+                    );
+                }
+                for (let rank = 1; rank <= activeDelegates; rank++) {
+                    if (!Object.prototype.hasOwnProperty.call(ranks, rank)) {
+                        fail(
+                            `dynamicReward.ranks has no reward for rank ${rank} (activeDelegates is ${activeDelegates})`,
+                        );
+                    }
+                    if (!this.isRewardAmount(ranks[rank])) {
+                        fail(
+                            `dynamicReward.ranks.${rank}, the reward for rank ${rank}, must be a non-negative safe integer or a decimal integer string of at most 18446744073709551615`,
+                        );
+                    }
+                }
+
+                if (!this.isRewardAmount(dynamicReward.secondaryReward)) {
+                    fail(
+                        "dynamicReward.secondaryReward must be a non-negative safe integer or a decimal integer string of at most 18446744073709551615",
+                    );
+                }
+            }
+        }
+    }
+
+    // A block reward in base units: a non-negative safe integer, or a canonical decimal string that fits the u64 reward field
+    private isRewardAmount(value: unknown): boolean {
+        if (typeof value === "number") {
+            return Number.isSafeInteger(value) && value >= 0;
+        }
+
+        return (
+            typeof value === "string" &&
+            /^(0|[1-9][0-9]*)$/.test(value) &&
+            BigInt(value) <= BigInt("18446744073709551615")
+        );
+    }
+
+    private isNetworkAddress(address: string): boolean {
+        try {
+            const buffer: Buffer = base58.decode(address);
+            const payload: Buffer = buffer.slice(0, -4);
+
+            return (
+                payload.length === 21 &&
+                HashAlgorithms.hash256(payload).slice(0, 4).equals(buffer.slice(-4)) &&
+                payload[0] === this.config!.network.pubKeyHash
+            );
+        } catch {
+            return false;
         }
     }
 }

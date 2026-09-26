@@ -127,7 +127,6 @@ export class Block implements IBlock {
     }
 
     public verifySignature(): boolean {
-        const { bip340 } = configManager.getMilestone(this.data.height);
         const bytes: Buffer = Serialiser.serialise(this.data, false);
         const hash: Buffer = HashAlgorithms.sha256(bytes);
 
@@ -135,7 +134,8 @@ export class Block implements IBlock {
             throw new Error();
         }
 
-        return Hash.verifySchnorr(hash, this.data.blockSignature, this.data.generatorPublicKey, bip340);
+        // Block signatures are BIP340 only; the legacy Schnorr block path is removed.
+        return Hash.verifySchnorr(hash, this.data.blockSignature, this.data.generatorPublicKey, true);
     }
 
     public toJson(): IBlockJson {
@@ -198,6 +198,11 @@ export class Block implements IBlock {
 
             if (this.transactions.length !== block.numberOfTransactions) {
                 result.errors.push("Invalid number of transactions");
+            }
+
+            // The payload is the 32-byte ids of the transactions the header counts.
+            if (block.payloadLength !== 32 * block.numberOfTransactions) {
+                result.errors.push("Invalid payload length");
             }
 
             if (this.transactions.length > constants.block.maxTransactions) {

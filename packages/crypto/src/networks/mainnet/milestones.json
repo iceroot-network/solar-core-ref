@@ -10,7 +10,7 @@
         "blocksToRevokeDelegateResignation": 106,
         "blockTime": 8,
         "burn": {
-            "feePercent": 90,
+            "feeBasisPoints": 9000,
             "txAmount": 2000000
         },
         "dynamicFees": {
@@ -133,7 +133,7 @@
         "bip340": true,
         "donations": {
             "Sgymbo4rg9aBeJJ2YmV12xdRY2xo6b94U9": {
-                "percent": 5,
+                "basisPoints": 500,
                 "purpose": "development"
             }
         }
@@ -147,11 +147,11 @@
         "height": 1812866,
         "donations": {
             "Sgymbo4rg9aBeJJ2YmV12xdRY2xo6b94U9": {
-                "percent": 5,
+                "basisPoints": 500,
                 "purpose": "development"
             },
             "Sdao2USyAz9B6RBgZeFyNDePuQAxfzZZHE": {
-                "percent": 5,
+                "basisPoints": 500,
                 "purpose": "foundation"
             }
         }

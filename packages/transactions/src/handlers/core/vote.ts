@@ -1,4 +1,4 @@
-import { Enums, Interfaces, Managers, Transactions } from "@solar-network/crypto";
+import { Enums, Interfaces, Transactions } from "@solar-network/crypto";
 import { Container, Contracts, Enums as AppEnums, Utils } from "@solar-network/kernel";
 
 import { AlreadyVotedError, NoVoteError, UnvoteMismatchError, VotedForNonDelegateError } from "../../errors";
@@ -77,7 +77,7 @@ export class LegacyVoteTransactionHandler extends TransactionHandler {
     }
 
     public async isActivated(): Promise<boolean> {
-        return Managers.configManager.getMilestone().legacyVote;
+        return false;
     }
 
     public async throwIfCannotBeApplied(
