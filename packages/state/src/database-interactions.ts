@@ -44,7 +44,27 @@ export class DatabaseInteraction {
             this.events.dispatch(Enums.StateEvent.Starting);
 
             const genesisBlockJson = Managers.configManager.get("genesisBlock");
-            const genesisBlock = Blocks.BlockFactory.fromJson(genesisBlockJson);
+
+            // Fail closed: the node never starts on an invalid genesis block, one that cannot be decoded included.
+            // terminate() alone leaves the process up; the exit is in a finally, so a failing terminate() still exits.
+            let genesisBlock: Interfaces.IBlock | undefined;
+            const genesisErrors: string[] = [];
+            try {
+                genesisBlock = Blocks.BlockFactory.fromJson(genesisBlockJson);
+            } catch (error) {
+                genesisErrors.push(`the genesis block could not be decoded: ${error.message}`);
+            }
+            if (genesisErrors.length === 0) {
+                genesisErrors.push(...(await this.verifyGenesisBlock(genesisBlock)));
+            }
+            if (genesisErrors.length > 0) {
+                this.logger.error(`Invalid genesis block: ${genesisErrors.join("; ")}`);
+                try {
+                    await this.app.terminate("Invalid genesis block");
+                } finally {
+                    process.exit(1);
+                }
+            }
 
             this.stateStore.setGenesisBlock(genesisBlock!);
 
@@ -90,6 +110,31 @@ export class DatabaseInteraction {
 
     public async restoreCurrentRound(): Promise<void> {
         await this.roundState.restore();
+    }
+
+    // The genesis block obeys the block rules and the transaction types of height 1, like any other
+    // block (patches 01, 02, 43 and 44). The wall-clock timestamp check is left out: a node may start
+    // before its network's epoch, when the genesis timestamp is still in the future.
+    private async verifyGenesisBlock(genesisBlock: Interfaces.IBlock | undefined): Promise<string[]> {
+        if (!genesisBlock) {
+            return ["the genesis block could not be decoded"];
+        }
+
+        const errors: string[] = genesisBlock.verification.errors
+            .filter((error) => error !== "Invalid block timestamp")
+            .map((error) => String(error));
+
+        await Managers.configManager.runAtHeight(1, async () => {
+            for (const transaction of genesisBlock.transactions) {
+                try {
+                    await this.handlerRegistry.getActivatedHandlerForData(transaction.data);
+                } catch (error) {
+                    errors.push(`transaction ${transaction.id}: ${error.message}`);
+                }
+            }
+        });
+
+        return errors;
     }
 
     private async reset(): Promise<void> {
