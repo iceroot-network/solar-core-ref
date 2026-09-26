@@ -160,7 +160,10 @@ export class VoteTransactionHandler extends TransactionHandler {
         const previousVotes = await this.getPreviousVotes(transaction);
 
         AppUtils.decreaseVoteBalances(sender, { updateVoters: true, walletRepository: this.walletRepository });
-        sender.setAttribute("votes", previousVotes);
+        sender.setAttribute(
+            "votes",
+            new Map(Object.entries(Utils.sortVotes(Object.fromEntries(previousVotes as Map<string, number>)))),
+        );
         sender.updateVoteBalances();
         AppUtils.increaseVoteBalances(sender, { updateVoters: true, walletRepository: this.walletRepository });
     }
