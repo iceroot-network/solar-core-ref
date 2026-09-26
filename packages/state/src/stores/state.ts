@@ -1,4 +1,4 @@
-import { Interfaces, Managers } from "@solar-network/crypto";
+import { Enums as CryptoEnums, Interfaces, Managers, Utils as CryptoUtils } from "@solar-network/crypto";
 import { Container, Contracts, Enums, Providers, Utils } from "@solar-network/kernel";
 import assert from "assert";
 import { OrderedMap, OrderedSet, Seq } from "immutable";
@@ -20,6 +20,7 @@ export class StateStore implements Contracts.State.StateStore {
 
     private blockchain = {};
     private genesisBlock?: Interfaces.IBlock;
+    private genesisIssuance?: CryptoUtils.BigNumber;
     private lastDownloadedBlock?: Interfaces.IBlockData;
     private lastStoredBlockHeight: number = 1;
     private blockPing?: Contracts.State.BlockPing;
@@ -62,6 +63,30 @@ export class StateStore implements Contracts.State.StateStore {
      */
     public setGenesisBlock(block: Interfaces.IBlock): void {
         this.genesisBlock = block;
+
+        // Genesis issuance (L-52): the items of every transfer in the genesis block sent by the generator key.
+        let issued: CryptoUtils.BigNumber = CryptoUtils.BigNumber.ZERO;
+        for (const transaction of block.transactions) {
+            if (
+                transaction.data.typeGroup === CryptoEnums.TransactionTypeGroup.Core &&
+                transaction.data.type === CryptoEnums.TransactionType.Core.Transfer &&
+                transaction.data.senderPublicKey === block.data.generatorPublicKey
+            ) {
+                for (const transfer of transaction.data.asset?.transfers ?? []) {
+                    issued = issued.plus(transfer.amount);
+                }
+            }
+        }
+        this.genesisIssuance = issued;
+    }
+
+    /**
+     * Get the amount issued by the genesis block.
+     */
+    public getGenesisIssuance(): CryptoUtils.BigNumber {
+        Utils.assert.defined<CryptoUtils.BigNumber>(this.genesisIssuance);
+
+        return this.genesisIssuance;
     }
 
     public getLastDownloadedBlock(): Interfaces.IBlockData | undefined {
