@@ -1,0 +1,51 @@
+name: Reference repository metadata checks
+
+on:
+  push:
+    branches: [prod]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: production-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  production-merge:
+    if: github.event.created == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Require the merged dev to prod pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            count=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls?per_page=100" --jq '[.[] | select(.merged_at != null and .merge_commit_sha == env.GITHUB_SHA and .base.ref == "prod" and .head.ref == "dev" and .base.repo.full_name == env.GITHUB_REPOSITORY and .head.repo.full_name == env.GITHUB_REPOSITORY)] | length')
+            if [ "$count" -gt 0 ]; then exit 0; fi
+            sleep 2
+          done
+          echo "::error::Production CI requires this exact commit to be a merged dev to prod PR in this repository."
+          exit 1
+
+  verify-reference:
+    needs: production-merge
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          sparse-checkout: |
+            .github
+          sparse-checkout-cone-mode: true
+      - name: Preserve the pinned reference tag and non-publishing package
+        run: |
+          git rev-parse --verify 'refs/tags/s1-ref-v2^{commit}'
+          python3 -c 'import json; p=json.load(open("package.json")); assert p["private"] is True; assert p["name"] == "core"'
+      # This is the compatibility reference, not an IceRoot node release.
+      # Do not run upstream schedules, install legacy dependencies, or publish packages here.
