@@ -1,4 +1,4 @@
-import { Blocks, Crypto, Interfaces, Managers, Transactions } from "@solar-network/crypto";
+import { Blocks, Interfaces, Transactions } from "@solar-network/crypto";
 import { Models } from "@solar-network/database";
 
 import * as Exceptions from "./exceptions/verifier";
@@ -41,17 +41,8 @@ export class Verifier {
         try {
             const block = Blocks.BlockFactory.fromData(blockEntity as Interfaces.IBlockData)!;
 
-            const bytes = Blocks.Serialiser.serialise(block.data, false);
-            const hash = Crypto.HashAlgorithms.sha256(bytes);
-
-            const { bip340 } = Managers.configManager.getMilestone(blockEntity.height);
-
-            isVerified = Crypto.Hash.verifySchnorr(
-                hash,
-                blockEntity.blockSignature,
-                blockEntity.generatorPublicKey,
-                bip340,
-            );
+            // The block signature rule itself: BIP340 only, whatever the milestone's bip340 says
+            isVerified = block.verifySignature();
         } catch (err) {
             throw new Exceptions.BlockVerifyException(blockEntity.id, err.message);
         }
