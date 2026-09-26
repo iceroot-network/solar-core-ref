@@ -141,3 +141,9 @@ export class DuplicateParticipantInMultiSignatureError extends CryptoError {
         super(`Invalid multisignature, because duplicate participant found`);
     }
 }
+
+export class VoteAssetTooLargeError extends CryptoError {
+    public constructor(size: number) {
+        super(`Vote asset is ${size} bytes, over the 1024-byte limit`);
+    }
+}
