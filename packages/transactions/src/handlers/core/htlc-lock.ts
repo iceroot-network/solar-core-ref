@@ -83,7 +83,7 @@ export class HtlcLockTransactionHandler extends TransactionHandler {
     }
 
     public async isActivated(): Promise<boolean> {
-        return Managers.configManager.getMilestone().htlcEnabled;
+        return false;
     }
 
     public async throwIfCannotBeApplied(

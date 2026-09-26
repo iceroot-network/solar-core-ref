@@ -54,7 +54,7 @@ export class VoteTransactionHandler extends TransactionHandler {
     }
 
     public async isActivated(): Promise<boolean> {
-        return !Managers.configManager.getMilestone().legacyVote;
+        return true;
     }
 
     public async throwIfCannotBeApplied(
