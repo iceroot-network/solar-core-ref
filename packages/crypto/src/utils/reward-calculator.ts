@@ -1,34 +1,13 @@
 import { configManager } from "../managers/config";
 import { BigNumber } from "./big-number";
 
+// The merged milestone at the height is the value in force; a later reward: 0 or dynamicReward: null applies
 const getReward = (height: number): BigNumber => {
-    const milestones = configManager.get("milestones");
-
-    for (let i = milestones.length - 1; i >= 0; i--) {
-        const milestone = milestones[i];
-        if (milestone.height <= height) {
-            if (milestone.reward) {
-                return BigNumber.make(milestone.reward);
-            }
-        }
-    }
-
-    return BigNumber.ZERO;
+    return BigNumber.make(configManager.getMilestone(height).reward ?? 0);
 };
 
 const getDynamicReward = (height: number) => {
-    const milestones = configManager.get("milestones");
-
-    for (let i = milestones.length - 1; i >= 0; i--) {
-        const milestone = milestones[i];
-        if (milestone.height <= height) {
-            if (milestone.dynamicReward) {
-                return milestone.dynamicReward;
-            }
-        }
-    }
-
-    return {};
+    return configManager.getMilestone(height).dynamicReward || {};
 };
 
 export const calculateReward = (height: number, rank: number): BigNumber => {
