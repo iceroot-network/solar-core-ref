@@ -200,6 +200,11 @@ export class Block implements IBlock {
                 result.errors.push("Invalid number of transactions");
             }
 
+            // The payload is the 32-byte ids of the transactions the header counts.
+            if (block.payloadLength !== 32 * block.numberOfTransactions) {
+                result.errors.push("Invalid payload length");
+            }
+
             if (this.transactions.length > constants.block.maxTransactions) {
                 if (block.height > 1) {
                     result.errors.push("Transactions length is too high");
