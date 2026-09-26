@@ -71,7 +71,13 @@ export class StateBuilder {
 
             this.events.dispatch(Enums.StateEvent.BuilderFinished);
         } catch (ex) {
-            this.logger.error(ex.stack);
+            // Fail closed: the node never starts on a state that cannot be built or is inconsistent.
+            // The exit is in a finally, so a failing terminate() cannot leave the process running.
+            try {
+                await this.app.terminate(`State Generation failed: ${ex.message}`, ex);
+            } finally {
+                process.exit(1);
+            }
         }
     }
 
@@ -130,7 +136,7 @@ export class StateBuilder {
 
                 if (!whitelistedNegativeBalances) {
                     logNegativeBalance(wallet, "balance", balance);
-                    throw new Error("Non-genesis wallet with negative balance");
+                    throw new Error("Wallet with negative balance");
                 }
 
                 const allowedNegativeBalance = balance.isEqualTo(
@@ -139,7 +145,7 @@ export class StateBuilder {
 
                 if (!allowedNegativeBalance) {
                     logNegativeBalance(wallet, "balance", balance);
-                    throw new Error("Non-genesis wallet with negative balance");
+                    throw new Error("Wallet with negative balance");
                 }
             }
 
