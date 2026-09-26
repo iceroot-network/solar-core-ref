@@ -164,14 +164,30 @@ export class ConfigManager {
         let lastMerged = 0;
 
         const overwriteMerge = (dest, source, options) => source;
-        // A later milestone replaces the rank table and the donation list whole
-        const replaceMerge = (key: string) =>
-            key === "ranks" || key === "donations" ? (dest: any, source: any) => source : undefined;
+        // A deep copy of JSON data that keeps every own key
+        const copy = (value: any): any =>
+            Array.isArray(value)
+                ? value.map(copy)
+                : typeof value === "object" && value !== null
+                ? Object.fromEntries(Object.entries(value).map(([key, item]) => [key, copy(item)]))
+                : value;
+        // Objects merge key by key and arrays are overwritten, with no replace rule at any depth below
+        const plainMerge = (dest: any, source: any) => deepmerge(dest, source, { arrayMerge: overwriteMerge });
+        // A later milestone replaces dynamicReward.ranks and the top-level donations whole, with a copy, so a
+        // merged milestone never shares an object with the raw configuration
+        const replaceMerge = (dest: any, source: any) => copy(source);
+        const dynamicRewardMerge = (dest: any, source: any) =>
+            deepmerge(dest, source, {
+                arrayMerge: overwriteMerge,
+                customMerge: (key: string) => (key === "ranks" ? replaceMerge : plainMerge),
+            });
+        const milestoneMerge = (key: string) =>
+            key === "donations" ? replaceMerge : key === "dynamicReward" ? dynamicRewardMerge : plainMerge;
 
         while (lastMerged < this.milestones.length - 1) {
             this.milestones[lastMerged + 1] = deepmerge(this.milestones[lastMerged], this.milestones[lastMerged + 1], {
                 arrayMerge: overwriteMerge,
-                customMerge: replaceMerge,
+                customMerge: milestoneMerge,
             });
             lastMerged++;
         }
