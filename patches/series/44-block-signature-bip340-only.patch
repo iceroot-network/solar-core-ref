@@ -1,0 +1,191 @@
+From d5d18c9a7faacc81b3fd1d76cf21a049025f0bb7 Mon Sep 17 00:00:00 2001
+From: NayiemW <37852059+NayiemW@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 19:26:28 -0700
+Subject: [PATCH] S1-44: block-signature-bip340-only (L-43, L-57, L-51)
+
+Block.verifySignature() always verifies a BIP340 signature and no longer
+reads the milestone's bip340 flag. A block signed with legacy Schnorr is
+invalid even under bip340: false, which removes the legacy-Schnorr block
+path that L-43 lists (disabled in the reference under L-51 and L-57).
+Patch 24 is the signing half. P2P status attestations keep legacy
+Schnorr (L-32); they call Crypto.Hash directly and are not affected.
+
+Test: patches/tests/44-block-signature-bip340-only.test.js. Under
+bip340: false a legacy-signed block fails with "Failed to verify block
+signature" (base: verifies) and a BIP340-signed block verifies (base:
+fails). Under bip340: true nothing changes.
+
+Patch: 44
+Ledger: L-43, L-57 (removals), L-51
+Consensus: yes (config-dependent only)
+---
+ packages/crypto/src/blocks/block.ts           |   4 +-
+ .../44-block-signature-bip340-only.test.js    | 134 ++++++++++++++++++
+ 2 files changed, 136 insertions(+), 2 deletions(-)
+ create mode 100644 patches/tests/44-block-signature-bip340-only.test.js
+
+diff --git a/packages/crypto/src/blocks/block.ts b/packages/crypto/src/blocks/block.ts
+index e3dae80a7..bcf9700dd 100644
+--- a/packages/crypto/src/blocks/block.ts
++++ b/packages/crypto/src/blocks/block.ts
+@@ -127,7 +127,6 @@ export class Block implements IBlock {
+     }
+ 
+     public verifySignature(): boolean {
+-        const { bip340 } = configManager.getMilestone(this.data.height);
+         const bytes: Buffer = Serialiser.serialise(this.data, false);
+         const hash: Buffer = HashAlgorithms.sha256(bytes);
+ 
+@@ -135,7 +134,8 @@ export class Block implements IBlock {
+             throw new Error();
+         }
+ 
+-        return Hash.verifySchnorr(hash, this.data.blockSignature, this.data.generatorPublicKey, bip340);
++        // L-43: block signatures are BIP340 only; the legacy Schnorr block path is removed.
++        return Hash.verifySchnorr(hash, this.data.blockSignature, this.data.generatorPublicKey, true);
+     }
+ 
+     public toJson(): IBlockJson {
+diff --git a/patches/tests/44-block-signature-bip340-only.test.js b/patches/tests/44-block-signature-bip340-only.test.js
+new file mode 100644
+index 000000000..a77b1ece2
+--- /dev/null
++++ b/patches/tests/44-block-signature-bip340-only.test.js
+@@ -0,0 +1,134 @@
++#!/usr/bin/env node
++// Patch 44 block-signature-bip340-only (L-43, L-57 removals, L-51).
++//
++// Block.verifySignature() always verifies a BIP340 signature and no longer reads the milestone's
++// bip340 flag, so a block signed with legacy Schnorr is invalid even under bip340: false. Patch 24
++// is the signing half (BlockFactory.make always signs BIP340).
++//
++// Usage: SOLAR_DIR=<built Solar checkout> node 44-block-signature-bip340-only.test.js
++"use strict";
++
++const path = require("path");
++
++const SOLAR_DIR = path.resolve(process.env.SOLAR_DIR || path.join(__dirname, "..", ".."));
++
++const load = (pkg) => require(path.join(SOLAR_DIR, "packages", pkg, "dist"));
++const { Blocks, Crypto, Identities, Managers, Utils } = load("crypto");
++const { BigNumber } = Utils;
++
++let passed = 0;
++let failed = 0;
++
++function check(name, fn) {
++    try {
++        const outcome = fn();
++        if (outcome === true) {
++            passed++;
++            console.log(`PASS ${name}`);
++        } else {
++            failed++;
++            console.log(`FAIL ${name}: ${outcome}`);
++        }
++    } catch (error) {
++        failed++;
++        console.log(`FAIL ${name}: threw ${error && error.message}`);
++    }
++}
++
++// Network configuration template (PLAN.md section 5), with the bip340 flag under test.
++function makeConfig(bip340) {
++    return {
++        network: {
++            name: "devnet",
++            messagePrefix: "Solar devnet message:\n",
++            addressCharacter: "d",
++            bip32: { public: 70617039, private: 70615956 },
++            pubKeyHash: 90,
++            nethash: "c9b03ab996ef3ac216a2ac53eaee71118cbf7995fa44449a7fb7f94bbe18bcca",
++            wif: 252,
++            slip44: 1,
++            client: { token: "dROOT", symbol: "dRT", explorer: "" },
++        },
++        milestones: [
++            {
++                height: 1,
++                activeDelegates: 53,
++                block: { version: 0, maxTransactions: 150, maxPayload: 2097152 },
++                blocksToRevokeDelegateResignation: 106,
++                blockTime: 8,
++                burn: { feeBasisPoints: 9000, txAmount: 2000000 },
++                epoch: "2026-01-01T00:00:00.000Z",
++                legacyTransfer: false,
++                legacyVote: false,
++                transfer: { maximum: 256, minimum: 1 },
++                reward: 0,
++                acceptLegacySchnorrTransactions: false,
++                bip340,
++                donations: {},
++            },
++        ],
++        genesisBlock: { transactions: [] },
++        exceptions: {},
++    };
++}
++
++const FORGER = Identities.Keys.fromPassphrase("patch 44 forger");
++const AUX = Buffer.alloc(32, 9);
++
++// An empty block at height 2, signed over its header hash with the given scheme.
++function signedBlock(scheme) {
++    const data = {
++        version: 0,
++        timestamp: 1000,
++        height: 2,
++        previousBlock: "fbdd5afb435e34729406ebc7d385727237bf386440799270536c39b9ee45605e",
++        numberOfTransactions: 0,
++        totalAmount: BigNumber.ZERO,
++        totalFee: BigNumber.ZERO,
++        reward: BigNumber.ZERO,
++        payloadLength: 0,
++        payloadHash: Crypto.HashAlgorithms.sha256([]).toString("hex"),
++        generatorPublicKey: FORGER.publicKey.secp256k1,
++        transactions: [],
++    };
++    const hash = Crypto.HashAlgorithms.sha256(Blocks.Serialiser.serialise(data, false));
++    data.blockSignature =
++        scheme === "legacy"
++            ? Crypto.Hash.signSchnorrLegacy(hash, FORGER)
++            : Crypto.Hash.signSchnorrBip340(hash, FORGER, AUX);
++    data.id = Blocks.Block.getId(data);
++    return Blocks.BlockFactory.fromData(data);
++}
++
++const verified = (block) =>
++    block.verification.verified ? true : `errors: ${JSON.stringify(block.verification.errors)}`;
++const signatureRejected = (block) => {
++    const errors = block.verification.errors.map(String);
++    if (block.verification.verified) {
++        return "verified";
++    }
++    if (block.verifySignature() !== false) {
++        return "verifySignature() is not false";
++    }
++    return errors.length === 1 && errors[0] === "Failed to verify block signature"
++        ? true
++        : `errors: ${JSON.stringify(errors)}`;
++};
++
++console.log(`SOLAR_DIR=${SOLAR_DIR}`);
++
++Managers.configManager.setConfig(makeConfig(false));
++check(
++    'bip340: false, legacy Schnorr block signature: fails with "Failed to verify block signature" (base: verifies)',
++    () => signatureRejected(signedBlock("legacy")),
++);
++check("bip340: false, BIP340 block signature: verifies (base: fails)", () => verified(signedBlock("bip340")));
++
++Managers.configManager.setConfig(makeConfig(true));
++check("bip340: true, BIP340 block signature: verifies", () => verified(signedBlock("bip340")));
++check('bip340: true, legacy Schnorr block signature: fails with "Failed to verify block signature"', () =>
++    signatureRejected(signedBlock("legacy")),
++);
++
++console.log(`44-block-signature-bip340-only: ${passed} passed, ${failed} failed`);
++process.exit(failed === 0 ? 0 : 1);
+-- 
+2.43.0
+

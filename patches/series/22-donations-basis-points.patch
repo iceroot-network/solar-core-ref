@@ -1,0 +1,368 @@
+From ae6b768371409a662321e9fd915ecdaa12afea43 Mon Sep 17 00:00:00 2001
+From: NayiemW <37852059+NayiemW@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 19:22:24 -0700
+Subject: [PATCH] S1-22: donations-basis-points (L-64, L-61)
+
+A donation share is now integer basis points: IDonation becomes
+{ basisPoints, purpose? } and calculateDonations pays
+floor(reward x basisPoints / 10000) per entry. A new private
+ConfigManager.validateMergedMilestones(), run by setConfig after the
+merge, refuses a donation list that is not a plain object, an address
+that is not a valid Base58Check address of the configured network
+(21-byte payload, first byte = pubKeyHash), basisPoints that is not a
+safe integer from 1 to 10000, any key other than basisPoints and
+purpose (a leftover percent included), and a sum over 10000. It throws
+InvalidMilestoneConfigurationError naming the height and the key, so a
+node refuses to start on a bad file. The mainnet and testnet presets
+change percent 5 to basisPoints 500; the amounts paid are unchanged.
+
+The address check uses bstring and HashAlgorithms directly rather than
+utils/base58, because utils/base58 imports the crypto index, which
+imports managers/config, and the manager validates the testnet preset
+while its module is loading.
+
+Test: patches/tests/22-donations-basis-points.test.js (fails on the
+unpatched build, passes here).
+
+Patch: 22
+Ledger: L-64, L-61
+Consensus: yes
+---
+ packages/crypto/src/interfaces/donation.ts    |   4 +-
+ packages/crypto/src/managers/config.ts        |  72 +++++++++
+ .../src/networks/mainnet/milestones.json      |   6 +-
+ .../src/networks/testnet/milestones.json      |   4 +-
+ packages/crypto/src/utils/index.ts            |   4 +-
+ .../tests/22-donations-basis-points.test.js   | 151 ++++++++++++++++++
+ 6 files changed, 232 insertions(+), 9 deletions(-)
+ create mode 100644 patches/tests/22-donations-basis-points.test.js
+
+diff --git a/packages/crypto/src/interfaces/donation.ts b/packages/crypto/src/interfaces/donation.ts
+index 130ed7433..bbcef532b 100644
+--- a/packages/crypto/src/interfaces/donation.ts
++++ b/packages/crypto/src/interfaces/donation.ts
+@@ -1,4 +1,4 @@
+ export interface IDonation {
+-    percent: number;
+-    purpose: string;
++    basisPoints: number;
++    purpose?: string;
+ }
+diff --git a/packages/crypto/src/managers/config.ts b/packages/crypto/src/managers/config.ts
+index a44d739ff..4cae79d8e 100644
+--- a/packages/crypto/src/managers/config.ts
++++ b/packages/crypto/src/managers/config.ts
+@@ -1,7 +1,9 @@
++import { base58 } from "bstring";
+ import deepmerge from "deepmerge";
+ import get from "lodash.get";
+ import set from "lodash.set";
+ 
++import { HashAlgorithms } from "../crypto/hash-algorithms";
+ import { InvalidMilestoneConfigurationError } from "../errors";
+ import { IMilestone } from "../interfaces";
+ import { NetworkConfig } from "../interfaces/networks";
+@@ -34,6 +36,7 @@ export class ConfigManager {
+ 
+         this.validateMilestones();
+         this.buildConstants();
++        this.validateMergedMilestones();
+     }
+ 
+     public setFromPreset(network: NetworkName): void {
+@@ -189,6 +192,75 @@ export class ConfigManager {
+             }
+         }
+     }
++
++    // Start-up checks on the merged milestones: a bad file refuses to start instead of halting the chain (L-64)
++    private validateMergedMilestones(): void {
++        if (!this.config || !this.milestones) {
++            throw new Error();
++        }
++
++        for (const milestone of this.getMilestones()) {
++            const fail = (message: string): never => {
++                throw new InvalidMilestoneConfigurationError(
++                    `Bad milestone at height: ${milestone.height}. ${message}`,
++                );
++            };
++
++            if (Object.prototype.hasOwnProperty.call(milestone, "donations")) {
++                const donations = milestone.donations;
++                if (typeof donations !== "object" || donations === null || Array.isArray(donations)) {
++                    fail("donations must be an object that maps each address to { basisPoints, purpose }");
++                }
++
++                let sum = 0;
++                for (const [address, donation] of Object.entries<any>(donations)) {
++                    if (!this.isNetworkAddress(address)) {
++                        fail(`donations: ${address} is not a valid address of this network`);
++                    }
++                    if (typeof donation !== "object" || donation === null || Array.isArray(donation)) {
++                        fail(`donations.${address} must be an object with basisPoints`);
++                    }
++                    for (const key of Object.keys(donation)) {
++                        if (key !== "basisPoints" && key !== "purpose") {
++                            fail(
++                                `donations.${address}.${key} is not allowed: a share is set by basisPoints (500 = 5%)`,
++                            );
++                        }
++                    }
++                    if (
++                        !Number.isSafeInteger(donation.basisPoints) ||
++                        donation.basisPoints < 1 ||
++                        donation.basisPoints > 10000
++                    ) {
++                        fail(`donations.${address}.basisPoints must be an integer from 1 to 10000`);
++                    }
++                    if (donation.purpose !== undefined && typeof donation.purpose !== "string") {
++                        fail(`donations.${address}.purpose must be a string`);
++                    }
++                    sum += donation.basisPoints;
++                }
++
++                if (sum > 10000) {
++                    fail(`donations add up to ${sum} basis points, over 10000`);
++                }
++            }
++        }
++    }
++
++    private isNetworkAddress(address: string): boolean {
++        try {
++            const buffer: Buffer = base58.decode(address);
++            const payload: Buffer = buffer.slice(0, -4);
++
++            return (
++                payload.length === 21 &&
++                HashAlgorithms.hash256(payload).slice(0, 4).equals(buffer.slice(-4)) &&
++                payload[0] === this.config!.network.pubKeyHash
++            );
++        } catch {
++            return false;
++        }
++    }
+ }
+ 
+ export const configManager = new ConfigManager();
+diff --git a/packages/crypto/src/networks/mainnet/milestones.json b/packages/crypto/src/networks/mainnet/milestones.json
+index 94c9ac778..340612fa2 100644
+--- a/packages/crypto/src/networks/mainnet/milestones.json
++++ b/packages/crypto/src/networks/mainnet/milestones.json
+@@ -133,7 +133,7 @@
+         "bip340": true,
+         "donations": {
+             "Sgymbo4rg9aBeJJ2YmV12xdRY2xo6b94U9": {
+-                "percent": 5,
++                "basisPoints": 500,
+                 "purpose": "development"
+             }
+         }
+@@ -147,11 +147,11 @@
+         "height": 1812866,
+         "donations": {
+             "Sgymbo4rg9aBeJJ2YmV12xdRY2xo6b94U9": {
+-                "percent": 5,
++                "basisPoints": 500,
+                 "purpose": "development"
+             },
+             "Sdao2USyAz9B6RBgZeFyNDePuQAxfzZZHE": {
+-                "percent": 5,
++                "basisPoints": 500,
+                 "purpose": "foundation"
+             }
+         }
+diff --git a/packages/crypto/src/networks/testnet/milestones.json b/packages/crypto/src/networks/testnet/milestones.json
+index 73d5a5742..f117619a6 100644
+--- a/packages/crypto/src/networks/testnet/milestones.json
++++ b/packages/crypto/src/networks/testnet/milestones.json
+@@ -137,11 +137,11 @@
+         "acceptLegacySchnorrTransactions": false,
+         "donations": {
+             "DSXP3m8MJhqZvybUMCnUkfAP5PQ4aVjozy": {
+-                "percent": 5,
++                "basisPoints": 500,
+                 "purpose": "testing"
+             },
+             "D646b6dx3sW5NAgMDTKAZ2hdC57K1BeRaK": {
+-                "percent": 5,
++                "basisPoints": 500,
+                 "purpose": "voting"
+             }
+         },
+diff --git a/packages/crypto/src/utils/index.ts b/packages/crypto/src/utils/index.ts
+index 3e768ee56..d8000e067 100644
+--- a/packages/crypto/src/utils/index.ts
++++ b/packages/crypto/src/utils/index.ts
+@@ -108,8 +108,8 @@ export const calculateDonations = (height: number, reward: BigNumber): Record<st
+         return {};
+     }
+ 
+-    for (const [wallet, { percent }] of Object.entries(constants.donations as Record<string, IDonation>)) {
+-        donations[wallet] = reward.times(Math.round(percent * 100)).dividedBy(10000);
++    for (const [wallet, { basisPoints }] of Object.entries(constants.donations as Record<string, IDonation>)) {
++        donations[wallet] = reward.times(basisPoints).dividedBy(10000);
+     }
+ 
+     return donations;
+diff --git a/patches/tests/22-donations-basis-points.test.js b/patches/tests/22-donations-basis-points.test.js
+new file mode 100644
+index 000000000..4431491f3
+--- /dev/null
++++ b/patches/tests/22-donations-basis-points.test.js
+@@ -0,0 +1,151 @@
++"use strict";
++
++// Patch 22 donations-basis-points (L-64, L-61).
++// Donations are integer basis points, paid as floor(reward x basisPoints / 10000), and the merged
++// milestones are validated in setConfig, so a bad donation list refuses to start.
++// Usage: SOLAR_DIR=<built Solar checkout> node patches/tests/22-donations-basis-points.test.js
++
++const path = require("path");
++
++const SOLAR_DIR = process.env.SOLAR_DIR || path.resolve(__dirname, "../..");
++const { Errors, Managers, Utils } = require(path.join(SOLAR_DIR, "packages/crypto/dist"));
++
++let passed = 0;
++let failed = 0;
++const check = (name, fn) => {
++    try {
++        const detail = fn();
++        if (detail === true) {
++            passed++;
++            console.log(`PASS ${name}`);
++        } else {
++            failed++;
++            console.log(`FAIL ${name}: ${detail}`);
++        }
++    } catch (error) {
++        failed++;
++        console.log(`FAIL ${name}: ${error.message.split("\n")[0]}`);
++    }
++};
++
++const P1 = "dZDbtMv86KMqo8iPMtAJLhoT5BVKfyVokA"; // byte 90
++const P2 = "dPiLD2Fi1dnQhnskBkSnDEPraaWtbTcYPj"; // byte 90
++const BAD_CHECKSUM = "dZDbtMv86KMqo8iPMtAJLhoT5BVKfyVokB"; // P1 with the last character changed
++const BYTE_30 = "DSXP3m8MJhqZvybUMCnUkfAP5PQ4aVjozy"; // a valid testnet (byte 30) address
++
++const network = {
++    name: "devnet",
++    messagePrefix: "Solar devnet message:\n",
++    addressCharacter: "d",
++    bip32: { public: 70617039, private: 70615956 },
++    pubKeyHash: 90,
++    nethash: "c9b03ab996ef3ac216a2ac53eaee71118cbf7995fa44449a7fb7f94bbe18bcca",
++    wif: 252,
++    slip44: 1,
++    client: { token: "dROOT", symbol: "dRT", explorer: "" },
++};
++
++const heightOne = () => ({
++    height: 1,
++    activeDelegates: 53,
++    block: { version: 0, maxTransactions: 150, maxPayload: 2097152 },
++    blocksToRevokeDelegateResignation: 106,
++    blockTime: 8,
++    burn: { feeBasisPoints: 9000, txAmount: 2000000 },
++    epoch: "2026-09-25T20:05:04.000Z",
++    fees: { staticFees: { transfer: 50000000 } },
++    legacyTransfer: false,
++    legacyVote: false,
++    p2p: { minimumVersions: [">=4.3.0"] },
++    transfer: { maximum: 256, minimum: 1 },
++    reward: 0,
++    bip340: true,
++    acceptLegacySchnorrTransactions: false,
++    donations: {},
++});
++
++const configure = (donations) =>
++    Managers.configManager.setConfig({
++        network,
++        milestones: [heightOne(), { height: 2, donations }],
++        exceptions: {},
++        genesisBlock: { transactions: [] },
++    });
++
++check("5 % of every L-59 tier, per recipient", () => {
++    configure({ [P1]: { basisPoints: 500, purpose: "placeholder-1" }, [P2]: { basisPoints: 500, purpose: "placeholder-2" } });
++    const got = [180000000, 190000000, 200000000, 210000000, 220000000].map((reward) => {
++        const donations = Utils.calculateDonations(2, Utils.BigNumber.make(reward));
++        return `${donations[P1]}/${donations[P2]}`;
++    });
++    const expected = ["9000000/9000000", "9500000/9500000", "10000000/10000000", "10500000/10500000", "11000000/11000000"];
++    return got.join(" ") === expected.join(" ") || `got ${got.join(" ")}`;
++});
++
++check("the payout is floored", () => {
++    configure({ [P1]: { basisPoints: 3333 } });
++    const donation = String(Utils.calculateDonations(2, Utils.BigNumber.make(100000001))[P1]);
++    return donation === "33330000" || `floor(100000001 x 3333 / 10000) gave ${donation}, expected 33330000`;
++});
++
++const refused = (name, donations, messagePart) =>
++    check(`refused: ${name}`, () => {
++        try {
++            configure(donations);
++        } catch (error) {
++            if (!(error instanceof Errors.InvalidMilestoneConfigurationError)) {
++                return `threw ${error.constructor.name}: ${error.message}`;
++            }
++            if (messagePart && !error.message.includes(messagePart)) {
++                return `message "${error.message}" does not name "${messagePart}"`;
++            }
++            return true;
++        }
++        return "setConfig accepted it";
++    });
++
++refused("a sum of 10001", { [P1]: { basisPoints: 5001 }, [P2]: { basisPoints: 5000 } }, "10001");
++refused("an entry null", { [P1]: null });
++refused("basisPoints '500'", { [P1]: { basisPoints: "500" } }, "basisPoints");
++refused("basisPoints NaN", { [P1]: { basisPoints: NaN } }, "basisPoints");
++refused("basisPoints 0", { [P1]: { basisPoints: 0 } }, "basisPoints");
++refused("basisPoints 1.5", { [P1]: { basisPoints: 1.5 } }, "basisPoints");
++refused("basisPoints 10001", { [P1]: { basisPoints: 10001 } }, "basisPoints");
++refused("an unknown key", { [P1]: { basisPoints: 500, share: 5 } }, "share");
++refused("a leftover percent", { [P1]: { percent: 5, purpose: "development" } }, "basisPoints");
++refused("an address with a bad checksum", { [BAD_CHECKSUM]: { basisPoints: 500 } }, BAD_CHECKSUM);
++refused("a byte-30 address on a byte-90 network", { [BYTE_30]: { basisPoints: 500 } }, BYTE_30);
++refused("donations: null", null, "donations");
++refused("donations as an array", [], "donations");
++refused("a purpose that is not a string", { [P1]: { basisPoints: 500, purpose: 5 } }, "purpose");
++
++check("accepted: donations {}", () => {
++    configure({});
++    const donations = Utils.calculateDonations(2, Utils.BigNumber.make(200000000));
++    return Object.keys(donations).length === 0 || `calculateDonations gave ${JSON.stringify(donations)}`;
++});
++
++check("accepted: a sum of exactly 10000", () => {
++    configure({ [P1]: { basisPoints: 5000 }, [P2]: { basisPoints: 5000, purpose: "placeholder-2" } });
++    const donations = Utils.calculateDonations(2, Utils.BigNumber.make(200000000));
++    return (String(donations[P1]) === "100000000" && String(donations[P2]) === "100000000") || `gave ${donations[P1]}/${donations[P2]}`;
++});
++
++check("the mainnet preset loads and pays 5 % to each recipient", () => {
++    Managers.configManager.setFromPreset("mainnet");
++    const donations = Utils.calculateDonations(1812866, Utils.BigNumber.make(1000000000));
++    const got = Object.entries(donations).map(([address, amount]) => `${address}=${amount}`).join(",");
++    const expected = "Sgymbo4rg9aBeJJ2YmV12xdRY2xo6b94U9=50000000,Sdao2USyAz9B6RBgZeFyNDePuQAxfzZZHE=50000000";
++    return got === expected || `got ${got}`;
++});
++
++check("the testnet preset loads and pays 5 % to each recipient", () => {
++    Managers.configManager.setFromPreset("testnet");
++    const donations = Utils.calculateDonations(502431, Utils.BigNumber.make(1000000000));
++    const got = Object.entries(donations).map(([address, amount]) => `${address}=${amount}`).join(",");
++    const expected = "DSXP3m8MJhqZvybUMCnUkfAP5PQ4aVjozy=50000000,D646b6dx3sW5NAgMDTKAZ2hdC57K1BeRaK=50000000";
++    return got === expected || `got ${got}`;
++});
++
++console.log(`SUMMARY 22-donations-basis-points: ${passed} passed, ${failed} failed`);
++process.exit(failed === 0 ? 0 : 1);
+-- 
+2.43.0
+
