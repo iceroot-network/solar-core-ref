@@ -328,12 +328,25 @@ export class RoundState implements Contracts.State.RoundState {
         const prevRoundState = await this.getDposPreviousRoundState(blocks, roundInfo);
 
         // TODO: Move to Dpos
+        const rankedAtRoundStart: Set<string> = new Set();
         for (const prevRoundDelegateWallet of prevRoundState.getActiveDelegates()) {
             // ! name suggest that this is pure function
             // ! when in fact it is manipulating current wallet repository setting delegate ranks
             const username = prevRoundDelegateWallet.getAttribute("delegate.username");
             const delegateWallet = this.walletRepository.findByUsername(username);
             delegateWallet.setAttribute("delegate.rank", prevRoundDelegateWallet.getAttribute("delegate.rank"));
+            rankedAtRoundStart.add(username);
+        }
+
+        // A running node ranks delegates only at round starts, so a delegate that had no rank at the start of
+        // this round (resigned then, or registered since) has none until the next round start
+        for (const delegateWallet of this.walletRepository.allByUsername()) {
+            if (
+                !rankedAtRoundStart.has(delegateWallet.getAttribute("delegate.username")) &&
+                delegateWallet.hasAttribute("delegate.rank")
+            ) {
+                delegateWallet.forgetAttribute("delegate.rank");
+            }
         }
 
         // ! return readonly array instead of taking slice
