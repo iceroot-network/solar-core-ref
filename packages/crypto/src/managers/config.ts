@@ -152,10 +152,14 @@ export class ConfigManager {
         let lastMerged = 0;
 
         const overwriteMerge = (dest, source, options) => source;
+        // A later milestone replaces the rank table and the donation list whole
+        const replaceMerge = (key: string) =>
+            key === "ranks" || key === "donations" ? (dest: any, source: any) => source : undefined;
 
         while (lastMerged < this.milestones.length - 1) {
             this.milestones[lastMerged + 1] = deepmerge(this.milestones[lastMerged], this.milestones[lastMerged + 1], {
                 arrayMerge: overwriteMerge,
+                customMerge: replaceMerge,
             });
             lastMerged++;
         }
