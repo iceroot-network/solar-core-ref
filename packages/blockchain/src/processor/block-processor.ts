@@ -277,11 +277,13 @@ export class BlockProcessor {
         const forgingDelegate: Contracts.State.Wallet = delegates[forgingInfo.currentForger];
 
         if (!forgingDelegate) {
-            this.logger.debug(
+            this.logger.warning(
                 `Could not decide if delegate ${
                     block.data.username
                 } is allowed to forge block ${block.data.height.toLocaleString()} :grey_question:`,
             );
+
+            return false;
         } else if (forgingDelegate.getAttribute("delegate.username") !== block.data.username) {
             const forgingUsername: string = forgingDelegate.getAttribute("delegate.username");
             this.logger.warning(

@@ -1,0 +1,197 @@
+#!/usr/bin/env node
+// Patch 41 generator-check-fail-closed (L-57).
+//
+// BlockProcessor.validateGenerator rejects a block when the round's delegate list has no delegate at
+// the block's slot index. Solar logged at debug level and accepted the block (fail-open).
+//
+// Usage: SOLAR_DIR=<built Solar checkout> node 41-generator-check-fail-closed.test.js
+"use strict";
+
+const path = require("path");
+
+const SOLAR_DIR = path.resolve(process.env.SOLAR_DIR || path.join(__dirname, "..", ".."));
+
+const load = (pkg) => require(path.join(SOLAR_DIR, "packages", pkg, "dist"));
+const { Identities, Managers } = load("crypto");
+const { Utils: AppUtils } = load("kernel");
+const { BlockProcessor } = require(path.join(SOLAR_DIR, "packages/blockchain/dist/processor/block-processor"));
+
+let passed = 0;
+let failed = 0;
+
+async function check(name, fn) {
+    try {
+        const outcome = await fn();
+        if (outcome === true) {
+            passed++;
+            console.log(`PASS ${name}`);
+        } else {
+            failed++;
+            console.log(`FAIL ${name}: ${outcome}`);
+        }
+    } catch (error) {
+        failed++;
+        console.log(`FAIL ${name}: threw ${error && error.message}`);
+    }
+}
+
+// Network configuration template (PLAN.md section 5).
+function makeConfig() {
+    return {
+        network: {
+            name: "devnet",
+            messagePrefix: "Solar devnet message:\n",
+            addressCharacter: "d",
+            bip32: { public: 70617039, private: 70615956 },
+            pubKeyHash: 90,
+            nethash: "c9b03ab996ef3ac216a2ac53eaee71118cbf7995fa44449a7fb7f94bbe18bcca",
+            wif: 252,
+            slip44: 1,
+            client: { token: "dROOT", symbol: "dRT", explorer: "" },
+        },
+        milestones: [
+            {
+                height: 1,
+                activeDelegates: 53,
+                block: { version: 0, maxTransactions: 150, maxPayload: 2097152 },
+                blocksToRevokeDelegateResignation: 106,
+                blockTime: 8,
+                burn: { feeBasisPoints: 9000, txAmount: 2000000 },
+                epoch: "2026-01-01T00:00:00.000Z",
+                legacyTransfer: false,
+                legacyVote: false,
+                transfer: { maximum: 256, minimum: 1 },
+                reward: 0,
+                acceptLegacySchnorrTransactions: false,
+                bip340: true,
+                donations: {},
+            },
+        ],
+        genesisBlock: { transactions: [] },
+        exceptions: {},
+    };
+}
+
+const BLOCK_TIME = 8;
+const SLOT_INDEX = 20;
+const HEIGHT = 30; // round 1 (heights 1 to 53)
+const TIMESTAMP = SLOT_INDEX * BLOCK_TIME;
+
+// Stub delegate wallets genesis_1 .. genesis_53; index k holds genesis_(k+1).
+const delegates = Array.from({ length: 53 }, (_, index) => {
+    const username = `genesis_${index + 1}`;
+    const publicKey = Identities.PublicKey.fromPassphrase(`patch 41 delegate ${index + 1}`);
+    const attributes = new Map([
+        ["delegate.username", username],
+        ["delegate.rank", index + 1],
+    ]);
+    return {
+        username,
+        publicKey,
+        getPublicKey: () => publicKey,
+        hasAttribute: (key) => attributes.has(key),
+        getAttribute: (key, defaultValue) => (attributes.has(key) ? attributes.get(key) : defaultValue),
+    };
+});
+const byUsername = new Map(delegates.map((wallet) => [wallet.username, wallet]));
+
+function makeProcessor(roundList) {
+    const logs = [];
+    const record = (level) => (message) => logs.push({ level, message });
+    const processor = Object.create(BlockProcessor.prototype);
+    processor.app = {
+        get: () => ({ findBlockByHeights: async () => [{ timestamp: 0 }] }),
+    };
+    processor.logger = {
+        debug: record("debug"),
+        info: record("info"),
+        notice: record("notice"),
+        warning: record("warning"),
+        error: record("error"),
+    };
+    processor.walletRepository = {
+        hasByUsername: (username) => byUsername.has(username),
+        findByUsername: (username) => byUsername.get(username),
+    };
+    const calls = [];
+    processor.triggers = {
+        call: async (name, args) => {
+            calls.push(name);
+            if (name !== "getActiveDelegates") {
+                throw new Error(`unexpected trigger ${name}`);
+            }
+            return roundList;
+        },
+    };
+    return { processor, logs, calls };
+}
+
+const blockBy = (wallet) => ({
+    data: {
+        version: 0,
+        height: HEIGHT,
+        timestamp: TIMESTAMP,
+        username: wallet.username,
+        generatorPublicKey: wallet.publicKey,
+    },
+});
+
+async function main() {
+    console.log(`SOLAR_DIR=${SOLAR_DIR}`);
+    Managers.configManager.setConfig(makeConfig());
+
+    const scheduled = delegates[SLOT_INDEX]; // genesis_21
+    const other = delegates[SLOT_INDEX + 1]; // genesis_22
+
+    await check(`precondition: timestamp ${TIMESTAMP} at height ${HEIGHT} maps to slot index ${SLOT_INDEX}`, () => {
+        const info = AppUtils.forgingInfoCalculator.calculateForgingInfo(TIMESTAMP, HEIGHT, () => 0);
+        return info.currentForger === SLOT_INDEX ? true : `currentForger is ${info.currentForger}`;
+    });
+
+    {
+        const { processor, logs, calls } = makeProcessor(delegates.slice(0, 10));
+        const result = await processor.validateGenerator(blockBy(scheduled));
+        await check("10-entry delegate list, slot index 20: validateGenerator is false (base: true)", () =>
+            result === false ? true : `got ${result}`,
+        );
+        await check("10-entry delegate list: the round list was asked for with getActiveDelegates", () =>
+            calls.length === 1 ? true : `trigger calls: ${calls.join(", ")}`,
+        );
+        await check("10-entry delegate list: a warning is logged (base: debug only)", () => {
+            const warnings = logs.filter((entry) => entry.level === "warning");
+            return warnings.length === 1 ? true : `log: ${JSON.stringify(logs)}`;
+        });
+    }
+
+    {
+        const { processor } = makeProcessor(delegates);
+        const result = await processor.validateGenerator(blockBy(scheduled));
+        await check("53-entry delegate list, scheduled delegate: validateGenerator is true", () =>
+            result === true ? true : `got ${result}`,
+        );
+    }
+
+    {
+        const { processor } = makeProcessor(delegates);
+        const result = await processor.validateGenerator(blockBy(other));
+        await check("53-entry delegate list, wrong delegate: validateGenerator is false", () =>
+            result === false ? true : `got ${result}`,
+        );
+    }
+
+    {
+        const { processor } = makeProcessor([]);
+        const result = await processor.validateGenerator(blockBy(scheduled));
+        await check("empty delegate list: validateGenerator is false (base: true)", () =>
+            result === false ? true : `got ${result}`,
+        );
+    }
+
+    console.log(`41-generator-check-fail-closed: ${passed} passed, ${failed} failed`);
+    process.exit(failed === 0 ? 0 : 1);
+}
+
+main().catch((error) => {
+    console.log(`FAIL test harness: ${error && error.stack}`);
+    process.exit(1);
+});
