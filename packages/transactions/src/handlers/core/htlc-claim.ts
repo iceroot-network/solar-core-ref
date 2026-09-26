@@ -1,4 +1,4 @@
-import { Crypto, Enums, Interfaces, Managers, Transactions, Utils } from "@solar-network/crypto";
+import { Crypto, Enums, Interfaces, Transactions, Utils } from "@solar-network/crypto";
 import { Container, Contracts, Utils as AppUtils } from "@solar-network/kernel";
 import { strict } from "assert";
 
@@ -53,7 +53,7 @@ export class HtlcClaimTransactionHandler extends TransactionHandler {
     }
 
     public async isActivated(): Promise<boolean> {
-        return Managers.configManager.getMilestone().htlcEnabled;
+        return false;
     }
 
     public dynamicFee(context: Contracts.Shared.DynamicFeeContext): Utils.BigNumber {

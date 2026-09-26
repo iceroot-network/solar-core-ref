@@ -50,7 +50,7 @@ export class LegacyTransferTransactionHandler extends TransactionHandler {
     }
 
     public async isActivated(): Promise<boolean> {
-        return Managers.configManager.getMilestone().legacyTransfer;
+        return false;
     }
 
     public async throwIfCannotEnterPool(transaction: Interfaces.ITransaction): Promise<void> {
