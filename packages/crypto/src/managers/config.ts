@@ -259,6 +259,10 @@ export class ConfigManager {
             if (!Number.isSafeInteger(burn.feeBasisPoints) || burn.feeBasisPoints < 0 || burn.feeBasisPoints > 10000) {
                 fail("burn.feeBasisPoints must be an integer from 0 to 10000");
             }
+            // A text or missing value would silently turn the burn transaction off: its handler checks the type
+            if (!Number.isSafeInteger(burn.txAmount) || burn.txAmount < 0) {
+                fail("burn.txAmount, the minimum burn amount in base units, must be a non-negative integer");
+            }
 
             if (Object.prototype.hasOwnProperty.call(milestone, "donations")) {
                 const donations = milestone.donations;
