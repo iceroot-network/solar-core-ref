@@ -1,4 +1,4 @@
 export interface IDonation {
-    percent: number;
-    purpose: string;
+    basisPoints: number;
+    purpose?: string;
 }

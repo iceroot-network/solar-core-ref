@@ -108,8 +108,8 @@ export const calculateDonations = (height: number, reward: BigNumber): Record<st
         return {};
     }
 
-    for (const [wallet, { percent }] of Object.entries(constants.donations as Record<string, IDonation>)) {
-        donations[wallet] = reward.times(Math.round(percent * 100)).dividedBy(10000);
+    for (const [wallet, { basisPoints }] of Object.entries(constants.donations as Record<string, IDonation>)) {
+        donations[wallet] = reward.times(basisPoints).dividedBy(10000);
     }
 
     return donations;

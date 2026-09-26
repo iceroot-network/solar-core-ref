@@ -1,7 +1,9 @@
+import { base58 } from "bstring";
 import deepmerge from "deepmerge";
 import get from "lodash.get";
 import set from "lodash.set";
 
+import { HashAlgorithms } from "../crypto/hash-algorithms";
 import { InvalidMilestoneConfigurationError } from "../errors";
 import { IMilestone } from "../interfaces";
 import { NetworkConfig } from "../interfaces/networks";
@@ -34,6 +36,7 @@ export class ConfigManager {
 
         this.validateMilestones();
         this.buildConstants();
+        this.validateMergedMilestones();
     }
 
     public setFromPreset(network: NetworkName): void {
@@ -187,6 +190,75 @@ export class ConfigManager {
                     `Bad milestone at height: ${current.height}. The number of delegates can only be changed at the beginning of a new round`,
                 );
             }
+        }
+    }
+
+    // Start-up checks on the merged milestones: a bad file refuses to start instead of halting the chain
+    private validateMergedMilestones(): void {
+        if (!this.config || !this.milestones) {
+            throw new Error();
+        }
+
+        for (const milestone of this.getMilestones()) {
+            const fail = (message: string): never => {
+                throw new InvalidMilestoneConfigurationError(
+                    `Bad milestone at height: ${milestone.height}. ${message}`,
+                );
+            };
+
+            if (Object.prototype.hasOwnProperty.call(milestone, "donations")) {
+                const donations = milestone.donations;
+                if (typeof donations !== "object" || donations === null || Array.isArray(donations)) {
+                    fail("donations must be an object that maps each address to { basisPoints, purpose }");
+                }
+
+                let sum = 0;
+                for (const [address, donation] of Object.entries<any>(donations)) {
+                    if (!this.isNetworkAddress(address)) {
+                        fail(`donations: ${address} is not a valid address of this network`);
+                    }
+                    if (typeof donation !== "object" || donation === null || Array.isArray(donation)) {
+                        fail(`donations.${address} must be an object with basisPoints`);
+                    }
+                    for (const key of Object.keys(donation)) {
+                        if (key !== "basisPoints" && key !== "purpose") {
+                            fail(
+                                `donations.${address}.${key} is not allowed: a share is set by basisPoints (500 = 5%)`,
+                            );
+                        }
+                    }
+                    if (
+                        !Number.isSafeInteger(donation.basisPoints) ||
+                        donation.basisPoints < 1 ||
+                        donation.basisPoints > 10000
+                    ) {
+                        fail(`donations.${address}.basisPoints must be an integer from 1 to 10000`);
+                    }
+                    if (donation.purpose !== undefined && typeof donation.purpose !== "string") {
+                        fail(`donations.${address}.purpose must be a string`);
+                    }
+                    sum += donation.basisPoints;
+                }
+
+                if (sum > 10000) {
+                    fail(`donations add up to ${sum} basis points, over 10000`);
+                }
+            }
+        }
+    }
+
+    private isNetworkAddress(address: string): boolean {
+        try {
+            const buffer: Buffer = base58.decode(address);
+            const payload: Buffer = buffer.slice(0, -4);
+
+            return (
+                payload.length === 21 &&
+                HashAlgorithms.hash256(payload).slice(0, 4).equals(buffer.slice(-4)) &&
+                payload[0] === this.config!.network.pubKeyHash
+            );
+        } catch {
+            return false;
         }
     }
 }
