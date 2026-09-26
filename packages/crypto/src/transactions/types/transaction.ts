@@ -76,13 +76,8 @@ export abstract class Transaction implements ITransaction {
     public setBurnedFee(height: number): void {
         const milestone = configManager.getMilestone(height);
 
-        this.data.burnedFee = BigNumber.ZERO;
-        if (typeof milestone.burn === "object" && typeof milestone.burn.feePercent === "number") {
-            const feePercent = parseInt(milestone.burn.feePercent);
-            if (feePercent >= 0 && feePercent <= 100) {
-                this.data.burnedFee = this.data.fee.times(feePercent).dividedBy(100);
-            }
-        }
+        // burn.feeBasisPoints is validated at start; 9000 burns floor(fee x 90 / 100)
+        this.data.burnedFee = this.data.fee.times(milestone.burn.feeBasisPoints).dividedBy(10000);
     }
 
     public verify(options?: ISerialiseOptions): boolean {

@@ -206,6 +206,17 @@ export class ConfigManager {
                 );
             };
 
+            const burn = milestone.burn;
+            if (typeof burn !== "object" || burn === null || Array.isArray(burn)) {
+                fail("burn must be an object with feeBasisPoints (9000 = 90%)");
+            }
+            if (Object.prototype.hasOwnProperty.call(burn, "feePercent")) {
+                fail("burn.feePercent is not supported: the fee burn is set by burn.feeBasisPoints (9000 = 90%)");
+            }
+            if (!Number.isSafeInteger(burn.feeBasisPoints) || burn.feeBasisPoints < 0 || burn.feeBasisPoints > 10000) {
+                fail("burn.feeBasisPoints must be an integer from 0 to 10000");
+            }
+
             if (Object.prototype.hasOwnProperty.call(milestone, "donations")) {
                 const donations = milestone.donations;
                 if (typeof donations !== "object" || donations === null || Array.isArray(donations)) {

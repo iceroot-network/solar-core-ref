@@ -10,7 +10,7 @@
         "blocksToRevokeDelegateResignation": 106,
         "blockTime": 8,
         "burn": {
-            "feePercent": 90,
+            "feeBasisPoints": 9000,
             "txAmount": 2000000
         },
         "dynamicFees": {
