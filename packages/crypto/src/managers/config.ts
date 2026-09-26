@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "async_hooks";
 import { base58 } from "bstring";
 import deepmerge from "deepmerge";
 import get from "lodash.get";
@@ -21,6 +22,7 @@ export class ConfigManager {
     private height: number | undefined;
     private milestone: IMilestone | undefined;
     private milestones: Record<string, any> | undefined;
+    private readonly ruleHeight = new AsyncLocalStorage<number>();
 
     public constructor() {
         this.setConfig(networks.testnet as unknown as NetworkConfig);
@@ -68,7 +70,13 @@ export class ConfigManager {
     }
 
     public getHeight(): number | undefined {
-        return this.height;
+        return this.ruleHeight.getStore() ?? this.height;
+    }
+
+    // Runs fn with a scoped height that getHeight() and getMilestone() honour, along fn's own async chain only.
+    // Transaction rules of block H read the milestone at H; the pool reads it at tip + 1 (L-97)
+    public runAtHeight<T>(height: number, fn: () => T): T {
+        return this.ruleHeight.run(height, fn);
     }
 
     public isNewMilestone(height?: number): boolean {
@@ -86,8 +94,9 @@ export class ConfigManager {
             throw new Error();
         }
 
-        if (!height && this.height) {
-            height = this.height;
+        const currentHeight = this.getHeight();
+        if (!height && currentHeight) {
+            height = currentHeight;
         }
 
         if (!height) {

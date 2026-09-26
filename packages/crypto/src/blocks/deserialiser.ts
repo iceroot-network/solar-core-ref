@@ -1,4 +1,5 @@
 import { IBlockData, ITransaction } from "../interfaces";
+import { configManager } from "../managers/config";
 import { TransactionFactory } from "../transactions";
 import { BigNumber, ByteBuffer } from "../utils";
 import { Block } from "./block";
@@ -20,7 +21,10 @@ export class Deserialiser {
 
         headerOnly = headerOnly || buf.getRemainderLength() === 0;
         if (!headerOnly) {
-            transactions = this.deserialiseTransactions(block, buf, options.deserialiseTransactionsUnchecked);
+            // The transactions of block H are decoded under the milestone at H (L-97)
+            transactions = configManager.runAtHeight(block.height, () =>
+                this.deserialiseTransactions(block, buf, options.deserialiseTransactionsUnchecked),
+            );
         }
 
         block.id = Block.getId(block);

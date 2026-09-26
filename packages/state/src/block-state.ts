@@ -1,4 +1,4 @@
-import { Enums, Identities, Interfaces, Utils } from "@solar-network/crypto";
+import { Enums, Identities, Interfaces, Managers, Utils } from "@solar-network/crypto";
 import { Repositories } from "@solar-network/database";
 import { Container, Contracts, Utils as AppUtils } from "@solar-network/kernel";
 import { Handlers } from "@solar-network/transactions";
@@ -30,58 +30,64 @@ export class BlockState implements Contracts.State.BlockState {
             index: number | undefined;
         },
     ): Promise<void> {
-        let forgerWallet: Contracts.State.Wallet;
+        // The transaction rules of block H, and any revert when it fails, read the milestone at H (L-97)
+        return Managers.configManager.runAtHeight(block.data.height, async () => {
+            let forgerWallet: Contracts.State.Wallet;
 
-        if (block.data.height === 1) {
-            this.initGenesisForgerWallet(block.data.generatorPublicKey);
-            forgerWallet = this.walletRepository.findByPublicKey(block.data.generatorPublicKey);
-        } else {
-            forgerWallet = this.walletRepository.findByUsername(block.data.username!);
-        }
-
-        const previousBlock = this.state.getLastBlock();
-
-        const appliedTransactions: Interfaces.ITransaction[] = [];
-        try {
-            for (const transaction of block.transactions) {
-                transactionProcessing.index = appliedTransactions.length;
-                await this.applyTransaction(block.data.height, transaction);
-                transactionProcessing.index = undefined;
-                appliedTransactions.push(transaction);
-            }
-            this.applyBlockToForger(forgerWallet, block);
-
-            this.state.setLastBlock(block);
-        } catch (error) {
-            for (const transaction of appliedTransactions.reverse()) {
-                await this.revertTransaction(block.data.height, transaction);
+            if (block.data.height === 1) {
+                this.initGenesisForgerWallet(block.data.generatorPublicKey);
+                forgerWallet = this.walletRepository.findByPublicKey(block.data.generatorPublicKey);
+            } else {
+                forgerWallet = this.walletRepository.findByUsername(block.data.username!);
             }
 
-            this.state.setLastBlock(previousBlock);
+            const previousBlock = this.state.getLastBlock();
 
-            throw error;
-        }
+            const appliedTransactions: Interfaces.ITransaction[] = [];
+            try {
+                for (const transaction of block.transactions) {
+                    transactionProcessing.index = appliedTransactions.length;
+                    await this.applyTransaction(block.data.height, transaction);
+                    transactionProcessing.index = undefined;
+                    appliedTransactions.push(transaction);
+                }
+                this.applyBlockToForger(forgerWallet, block);
+
+                this.state.setLastBlock(block);
+            } catch (error) {
+                for (const transaction of appliedTransactions.reverse()) {
+                    await this.revertTransaction(block.data.height, transaction);
+                }
+
+                this.state.setLastBlock(previousBlock);
+
+                throw error;
+            }
+        });
     }
 
     public async revertBlock(block: Interfaces.IBlock): Promise<void> {
-        const forgerWallet = this.walletRepository.findByUsername(block.data.username!);
+        // Reverting block H reads the milestone at H (L-97)
+        return Managers.configManager.runAtHeight(block.data.height, async () => {
+            const forgerWallet = this.walletRepository.findByUsername(block.data.username!);
 
-        const revertedTransactions: Interfaces.ITransaction[] = [];
-        try {
-            await this.revertBlockFromForger(forgerWallet, block);
+            const revertedTransactions: Interfaces.ITransaction[] = [];
+            try {
+                await this.revertBlockFromForger(forgerWallet, block);
 
-            for (const transaction of block.transactions.slice().reverse()) {
-                await this.revertTransaction(block.data.height, transaction);
-                revertedTransactions.push(transaction);
+                for (const transaction of block.transactions.slice().reverse()) {
+                    await this.revertTransaction(block.data.height, transaction);
+                    revertedTransactions.push(transaction);
+                }
+            } catch (error) {
+                this.logger.error(error.stack);
+                this.logger.error("Failed to revert all transactions in block - applying previous transactions");
+                for (const transaction of revertedTransactions.reverse()) {
+                    await this.applyTransaction(block.data.height, transaction);
+                }
+                throw error;
             }
-        } catch (error) {
-            this.logger.error(error.stack);
-            this.logger.error("Failed to revert all transactions in block - applying previous transactions");
-            for (const transaction of revertedTransactions.reverse()) {
-                await this.applyTransaction(block.data.height, transaction);
-            }
-            throw error;
-        }
+        });
     }
 
     public async applyTransaction(height: number, transaction: Interfaces.ITransaction): Promise<void> {

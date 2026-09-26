@@ -1,4 +1,4 @@
-import { Interfaces, Transactions } from "@solar-network/crypto";
+import { Interfaces, Managers, Transactions } from "@solar-network/crypto";
 import { Container, Contracts, Enums, Providers, Utils as AppUtils } from "@solar-network/kernel";
 
 import { PoolFullError, TransactionAlreadyInPoolError } from "./errors";
@@ -121,147 +121,154 @@ export class Service implements Contracts.Pool.Service {
         recheckValidity: boolean = false,
     ): Promise<void> {
         await this.lock.runExclusive(async () => {
-            if (this.disposed) {
-                return;
-            }
-
-            this.mempool.flush();
-
-            let previouslyForgedSuccesses = 0;
-            let previouslyForgedFailures = 0;
-            let previouslyStoredSuccesses = 0;
-            let previouslyStoredExpirations = 0;
-            let previouslyStoredFailures = 0;
-
-            const previouslyForgedStoredIds: string[] = [];
-
-            for (const { addresses, id, serialised } of previouslyForgedTransactions) {
-                try {
-                    const previouslyForgedTransaction = Transactions.TransactionFactory.fromBytesUnsafe(
-                        serialised,
-                        id,
-                        addresses,
-                    );
-
-                    AppUtils.assert.defined<string>(previouslyForgedTransaction.id);
-                    AppUtils.assert.defined<string>(previouslyForgedTransaction.data.senderId);
-
-                    await this.addTransactionToMempool(previouslyForgedTransaction);
-
-                    this.storage.addTransaction({
-                        height: this.stateStore.getLastHeight(),
-                        id: previouslyForgedTransaction.id,
-                        recipientId: (previouslyForgedTransaction.addresses.recipientId || []).join(","),
-                        senderId: previouslyForgedTransaction.data.senderId,
-                        serialised: previouslyForgedTransaction.serialised,
-                    });
-
-                    previouslyForgedStoredIds.push(previouslyForgedTransaction.id);
-
-                    previouslyForgedSuccesses++;
-                } catch (error) {
-                    this.logger.debug(
-                        `Failed to re-add previously forged transaction ${id} to the pool: ${error.message} :warning:`,
-                    );
-                    previouslyForgedFailures++;
-                }
-            }
-
-            const maxTransactionAge: number = this.configuration.getRequired<number>("maxTransactionAge");
-            const lastHeight: number = this.stateStore.getLastHeight();
-            const expiredHeight: number = lastHeight - maxTransactionAge;
-
-            for (const { height, id, recipientId, senderId, serialised } of this.storage.getAllTransactions()) {
-                if (previouslyForgedStoredIds.includes(id)) {
-                    continue;
+            // Re-added transactions are judged by the rules of the next block, tip + 1 (L-97)
+            await Managers.configManager.runAtHeight(this.stateStore.getLastHeight() + 1, async () => {
+                if (this.disposed) {
+                    return;
                 }
 
-                if (height > expiredHeight) {
+                this.mempool.flush();
+
+                let previouslyForgedSuccesses = 0;
+                let previouslyForgedFailures = 0;
+                let previouslyStoredSuccesses = 0;
+                let previouslyStoredExpirations = 0;
+                let previouslyStoredFailures = 0;
+
+                const previouslyForgedStoredIds: string[] = [];
+
+                for (const { addresses, id, serialised } of previouslyForgedTransactions) {
                     try {
-                        const addresses: Interfaces.IDeserialiseAddresses = {
-                            senderId,
-                            recipientId: (recipientId || "").split(","),
-                        };
-                        if (addresses.recipientId![0].length === 0) {
-                            delete addresses.recipientId;
-                        }
-
-                        const previouslyStoredTransaction = Transactions.TransactionFactory.fromBytesUnsafe(
+                        const previouslyForgedTransaction = Transactions.TransactionFactory.fromBytesUnsafe(
                             serialised,
                             id,
                             addresses,
                         );
-                        await this.addTransactionToMempool(previouslyStoredTransaction);
-                        previouslyStoredSuccesses++;
-                    } catch (error) {
-                        this.storage.removeTransaction(id);
-                        if (!recheckValidity) {
-                            this.logger.debug(
-                                `Failed to re-add previously stored transaction ${id} to the pool: ${error.message} :warning:`,
-                            );
-                        }
-                        previouslyStoredFailures++;
-                    }
-                } else {
-                    this.storage.removeTransaction(id);
-                    this.logger.debug(`Not re-adding previously stored expired transaction to the pool: ${id}`);
-                    previouslyStoredExpirations++;
-                }
-            }
 
-            if (!recheckValidity && previouslyForgedSuccesses >= 1) {
-                this.logger.info(
-                    `${AppUtils.pluralise(
-                        "previously forged transaction",
-                        previouslyForgedSuccesses,
-                        true,
-                    )} re-added to the pool :money_with_wings:`,
-                );
-            }
-            if (previouslyForgedFailures >= 1) {
-                this.logger.warning(
-                    `${AppUtils.pluralise(
-                        "previously forged transaction",
-                        previouslyForgedFailures,
-                        true,
-                    )} could not be re-added to the pool :warning:`,
-                );
-            }
-            if (!recheckValidity && previouslyStoredSuccesses >= 1) {
-                this.logger.info(
-                    `${AppUtils.pluralise(
-                        "previously stored transaction",
-                        previouslyStoredSuccesses,
-                        true,
-                    )} re-added to the pool :money_with_wings:`,
-                );
-            }
-            if (previouslyStoredExpirations >= 1) {
-                this.logger.info(
-                    `${AppUtils.pluralise("transaction", previouslyStoredExpirations, true)} in the pool expired :zap:`,
-                );
-            }
-            if (previouslyStoredFailures >= 1) {
-                if (recheckValidity) {
-                    this.logger.warning(
+                        AppUtils.assert.defined<string>(previouslyForgedTransaction.id);
+                        AppUtils.assert.defined<string>(previouslyForgedTransaction.data.senderId);
+
+                        await this.addTransactionToMempool(previouslyForgedTransaction);
+
+                        this.storage.addTransaction({
+                            height: this.stateStore.getLastHeight(),
+                            id: previouslyForgedTransaction.id,
+                            recipientId: (previouslyForgedTransaction.addresses.recipientId || []).join(","),
+                            senderId: previouslyForgedTransaction.data.senderId,
+                            serialised: previouslyForgedTransaction.serialised,
+                        });
+
+                        previouslyForgedStoredIds.push(previouslyForgedTransaction.id);
+
+                        previouslyForgedSuccesses++;
+                    } catch (error) {
+                        this.logger.debug(
+                            `Failed to re-add previously forged transaction ${id} to the pool: ${error.message} :warning:`,
+                        );
+                        previouslyForgedFailures++;
+                    }
+                }
+
+                const maxTransactionAge: number = this.configuration.getRequired<number>("maxTransactionAge");
+                const lastHeight: number = this.stateStore.getLastHeight();
+                const expiredHeight: number = lastHeight - maxTransactionAge;
+
+                for (const { height, id, recipientId, senderId, serialised } of this.storage.getAllTransactions()) {
+                    if (previouslyForgedStoredIds.includes(id)) {
+                        continue;
+                    }
+
+                    if (height > expiredHeight) {
+                        try {
+                            const addresses: Interfaces.IDeserialiseAddresses = {
+                                senderId,
+                                recipientId: (recipientId || "").split(","),
+                            };
+                            if (addresses.recipientId![0].length === 0) {
+                                delete addresses.recipientId;
+                            }
+
+                            const previouslyStoredTransaction = Transactions.TransactionFactory.fromBytesUnsafe(
+                                serialised,
+                                id,
+                                addresses,
+                            );
+                            await this.addTransactionToMempool(previouslyStoredTransaction);
+                            previouslyStoredSuccesses++;
+                        } catch (error) {
+                            this.storage.removeTransaction(id);
+                            if (!recheckValidity) {
+                                this.logger.debug(
+                                    `Failed to re-add previously stored transaction ${id} to the pool: ${error.message} :warning:`,
+                                );
+                            }
+                            previouslyStoredFailures++;
+                        }
+                    } else {
+                        this.storage.removeTransaction(id);
+                        this.logger.debug(`Not re-adding previously stored expired transaction to the pool: ${id}`);
+                        previouslyStoredExpirations++;
+                    }
+                }
+
+                if (!recheckValidity && previouslyForgedSuccesses >= 1) {
+                    this.logger.info(
                         `${AppUtils.pluralise(
-                            "transaction",
-                            previouslyStoredFailures,
+                            "previously forged transaction",
+                            previouslyForgedSuccesses,
                             true,
-                        )} removed from the pool as ${
-                            previouslyStoredFailures !== 1 ? "they are" : "it is"
-                        } no longer valid :zap:`,
+                        )} re-added to the pool :money_with_wings:`,
                     );
-                } else {
+                }
+                if (previouslyForgedFailures >= 1) {
                     this.logger.warning(
                         `${AppUtils.pluralise(
-                            "previously stored transaction",
-                            previouslyStoredFailures,
+                            "previously forged transaction",
+                            previouslyForgedFailures,
                             true,
                         )} could not be re-added to the pool :warning:`,
                     );
                 }
-            }
+                if (!recheckValidity && previouslyStoredSuccesses >= 1) {
+                    this.logger.info(
+                        `${AppUtils.pluralise(
+                            "previously stored transaction",
+                            previouslyStoredSuccesses,
+                            true,
+                        )} re-added to the pool :money_with_wings:`,
+                    );
+                }
+                if (previouslyStoredExpirations >= 1) {
+                    this.logger.info(
+                        `${AppUtils.pluralise(
+                            "transaction",
+                            previouslyStoredExpirations,
+                            true,
+                        )} in the pool expired :zap:`,
+                    );
+                }
+                if (previouslyStoredFailures >= 1) {
+                    if (recheckValidity) {
+                        this.logger.warning(
+                            `${AppUtils.pluralise(
+                                "transaction",
+                                previouslyStoredFailures,
+                                true,
+                            )} removed from the pool as ${
+                                previouslyStoredFailures !== 1 ? "they are" : "it is"
+                            } no longer valid :zap:`,
+                        );
+                    } else {
+                        this.logger.warning(
+                            `${AppUtils.pluralise(
+                                "previously stored transaction",
+                                previouslyStoredFailures,
+                                true,
+                            )} could not be re-added to the pool :warning:`,
+                        );
+                    }
+                }
+            });
         });
     }
 
