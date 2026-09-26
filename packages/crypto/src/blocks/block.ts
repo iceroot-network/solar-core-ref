@@ -127,7 +127,6 @@ export class Block implements IBlock {
     }
 
     public verifySignature(): boolean {
-        const { bip340 } = configManager.getMilestone(this.data.height);
         const bytes: Buffer = Serialiser.serialise(this.data, false);
         const hash: Buffer = HashAlgorithms.sha256(bytes);
 
@@ -135,7 +134,8 @@ export class Block implements IBlock {
             throw new Error();
         }
 
-        return Hash.verifySchnorr(hash, this.data.blockSignature, this.data.generatorPublicKey, bip340);
+        // L-43: block signatures are BIP340 only; the legacy Schnorr block path is removed.
+        return Hash.verifySchnorr(hash, this.data.blockSignature, this.data.generatorPublicKey, true);
     }
 
     public toJson(): IBlockJson {
