@@ -1,4 +1,4 @@
-import { Enums, Interfaces, Transactions, Utils } from "@solar-network/crypto";
+import { Enums, Interfaces, Managers, Transactions, Utils } from "@solar-network/crypto";
 import { Container, Contracts, Utils as AppUtils } from "@solar-network/kernel";
 
 import { InsufficientBalanceError } from "../../errors";
@@ -27,6 +27,10 @@ export class TransferTransactionHandler extends TransactionHandler {
             type: this.getConstructor().type,
         };
 
+        const genesisGeneratorPublicKey: string | undefined = Managers.configManager.get(
+            "genesisBlock.generatorPublicKey",
+        );
+
         for await (const transaction of this.transactionHistoryService.streamByCriteria(criteria)) {
             AppUtils.assert.defined<string>(transaction.senderId);
             AppUtils.assert.defined<object>(transaction.asset?.transfers);
@@ -40,10 +44,19 @@ export class TransferTransactionHandler extends TransactionHandler {
                 this.walletRepository.index(wallet);
             }
 
+            // Genesis issuance: a transfer at height 1 from the genesis generator key creates the
+            // amounts it pays, so the sender is not debited.
+            const isGenesisIssuance: boolean =
+                transaction.blockHeight === 1 &&
+                genesisGeneratorPublicKey !== undefined &&
+                transaction.senderPublicKey === genesisGeneratorPublicKey;
+
             for (const transfer of transaction.asset.transfers) {
                 const recipient: Contracts.State.Wallet = this.walletRepository.findByAddress(transfer.recipientId);
                 recipient.increaseBalance(transfer.amount);
-                wallet.decreaseBalance(transfer.amount);
+                if (!isGenesisIssuance) {
+                    wallet.decreaseBalance(transfer.amount);
+                }
             }
         }
     }

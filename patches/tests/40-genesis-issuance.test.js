@@ -1,0 +1,450 @@
+#!/usr/bin/env node
+// Patch 40 genesis-issuance.
+//
+// Every 1/6 transfer in the genesis block (height 1) whose sender is the genesis generatorPublicKey is
+// issuance: its items credit their recipients and the sender is not debited. `issued` is the sum of
+// those items. No wallet balance may be negative, the genesis sender included.
+//
+// Usage: SOLAR_DIR=<built Solar checkout> node 40-genesis-issuance.test.js
+// DEVNET_CRYPTO may point at a directory with a real genesisBlock.json; when the file exists the
+// checks also run on that genesis.
+"use strict";
+
+const fs = require("fs");
+const path = require("path");
+
+const SOLAR_DIR = path.resolve(process.env.SOLAR_DIR || path.join(__dirname, "..", ".."));
+const DEVNET_CRYPTO = process.env.DEVNET_CRYPTO || path.join(__dirname, "devnet-crypto");
+
+const load = (pkg) => require(path.join(SOLAR_DIR, "packages", pkg, "dist"));
+const { Blocks, Identities, Managers, Utils } = load("crypto");
+const { Handlers } = load("transactions");
+const { StateBuilder, Stores } = load("state");
+const { BigNumber } = Utils;
+
+let passed = 0;
+let failed = 0;
+
+async function check(name, fn) {
+    try {
+        const outcome = await fn();
+        if (outcome === true) {
+            passed++;
+            console.log(`PASS ${name}`);
+        } else {
+            failed++;
+            console.log(`FAIL ${name}: ${outcome}`);
+        }
+    } catch (error) {
+        failed++;
+        console.log(`FAIL ${name}: threw ${error && error.message}`);
+    }
+}
+
+// Network configuration template (see patches/README.md).
+function makeConfig(genesisBlock) {
+    return {
+        network: {
+            name: "devnet",
+            messagePrefix: "Solar devnet message:\n",
+            addressCharacter: "d",
+            bip32: { public: 70617039, private: 70615956 },
+            pubKeyHash: 90,
+            nethash: "c9b03ab996ef3ac216a2ac53eaee71118cbf7995fa44449a7fb7f94bbe18bcca",
+            wif: 252,
+            slip44: 1,
+            client: { token: "dROOT", symbol: "dRT", explorer: "" },
+        },
+        milestones: [
+            {
+                height: 1,
+                activeDelegates: 53,
+                block: { version: 0, maxTransactions: 150, maxPayload: 2097152 },
+                blocksToRevokeDelegateResignation: 106,
+                blockTime: 8,
+                burn: { feeBasisPoints: 9000, txAmount: 2000000 },
+                epoch: "2026-01-01T00:00:00.000Z",
+                legacyTransfer: false,
+                legacyVote: false,
+                transfer: { maximum: 256, minimum: 1 },
+                reward: 0,
+                acceptLegacySchnorrTransactions: false,
+                bip340: true,
+                donations: {},
+            },
+        ],
+        genesisBlock,
+        exceptions: {},
+    };
+}
+
+// A stub allocation: one 1/6 from the generator key with three items.
+const GENERATOR_PUBLIC_KEY = "0334f21b095dbab8c1c602ff0df73371605dd9b79193eb55c89b50d86be0defdea";
+// A key that is neither the generator nor a genesis recipient.
+const OTHER_PUBLIC_KEY = Identities.PublicKey.fromPassphrase("patch 40 other sender");
+const RECIPIENT_1 = "daTBxkSJk2tZhujYcYSQtxj5RRFZ8HcxW8";
+const RECIPIENT_2 = "dZ1W1GsDCSyhR148oMhuHy3PkhnnSGCqVn";
+const RECIPIENT_3 = "dMVgdVMdEWR2rVH6RRgXqheywVTzbgLNyG";
+const ISSUED = "10000000000000000";
+
+function transferData({ senderPublicKey, blockHeight, sequence, nonce, items }) {
+    return {
+        id: `${String(blockHeight).padStart(8, "0")}${String(sequence).padStart(56, "0")}`,
+        headerType: 0,
+        version: 3,
+        network: 90,
+        typeGroup: 1,
+        type: 6,
+        nonce: BigNumber.make(nonce),
+        senderPublicKey,
+        senderId: Identities.Address.fromPublicKey(senderPublicKey),
+        fee: BigNumber.ZERO,
+        asset: {
+            transfers: items.map(([recipientId, amount]) => ({ recipientId, amount: BigNumber.make(amount) })),
+        },
+        blockHeight,
+        sequence,
+    };
+}
+
+const genesisTransfer = () =>
+    transferData({
+        senderPublicKey: GENERATOR_PUBLIC_KEY,
+        blockHeight: 1,
+        sequence: 0,
+        nonce: 1,
+        items: [
+            [RECIPIENT_1, "5000000000000000"],
+            [RECIPIENT_2, "3000000000000000"],
+            [RECIPIENT_3, "2000000000000000"],
+        ],
+    });
+
+const delegateRegistration = () => ({
+    id: "00000001" + "1".padStart(56, "0"),
+    headerType: 0,
+    typeGroup: 1,
+    type: 2,
+    nonce: BigNumber.ONE,
+    senderPublicKey: OTHER_PUBLIC_KEY,
+    senderId: Identities.Address.fromPublicKey(OTHER_PUBLIC_KEY),
+    fee: BigNumber.ZERO,
+    asset: { delegate: { username: "genesis_1" } },
+    blockHeight: 1,
+    sequence: 1,
+});
+
+// The configured genesis block (Managers.configManager "genesisBlock").
+const stubGenesisJson = () => ({
+    height: 1,
+    generatorPublicKey: GENERATOR_PUBLIC_KEY,
+    transactions: [genesisTransfer(), delegateRegistration()],
+});
+
+// An IBlock-like genesis for StateStore.setGenesisBlock.
+const stubGenesisBlock = (transactions) => ({
+    data: { height: 1, generatorPublicKey: GENERATOR_PUBLIC_KEY, numberOfTransactions: transactions.length },
+    transactions: transactions.map((data) => ({ data })),
+});
+
+class StubWallet {
+    constructor(address) {
+        this.address = address;
+        this.balance = BigNumber.ZERO;
+        this.nonce = BigNumber.ZERO;
+        this.publicKey = undefined;
+        this.attributes = new Map();
+    }
+    getAddress() {
+        return this.address;
+    }
+    getPublicKey() {
+        return this.publicKey;
+    }
+    setPublicKey(publicKey) {
+        this.publicKey = publicKey;
+    }
+    getBalance() {
+        return this.balance;
+    }
+    setBalance(balance) {
+        this.balance = BigNumber.make(balance);
+    }
+    increaseBalance(amount) {
+        this.balance = this.balance.plus(amount);
+        return this;
+    }
+    decreaseBalance(amount) {
+        this.balance = this.balance.minus(amount);
+        return this;
+    }
+    getNonce() {
+        return this.nonce;
+    }
+    setNonce(nonce) {
+        this.nonce = nonce;
+    }
+    hasAttribute(key) {
+        return this.attributes.has(key);
+    }
+    getAttribute(key, defaultValue) {
+        return this.attributes.has(key) ? this.attributes.get(key) : defaultValue;
+    }
+}
+
+class StubWalletRepository {
+    constructor() {
+        this.wallets = new Map();
+    }
+    findByAddress(address) {
+        if (!this.wallets.has(address)) {
+            this.wallets.set(address, new StubWallet(address));
+        }
+        return this.wallets.get(address);
+    }
+    index() {}
+    allByAddress() {
+        return [...this.wallets.values()];
+    }
+}
+
+const silentLogger = { debug() {}, info() {}, notice() {}, warning() {}, error() {} };
+
+// Runs TransferTransactionHandler.bootstrap over a stub transaction history.
+async function bootstrapTransfers(transactions) {
+    const repository = new StubWalletRepository();
+    const handler = Object.create(Handlers.Core.TransferTransactionHandler.prototype);
+    handler.walletRepository = repository;
+    handler.transactionHistoryService = {
+        async *streamByCriteria(criteria) {
+            for (const transaction of transactions) {
+                if (transaction.typeGroup === criteria.typeGroup && transaction.type === criteria.type) {
+                    yield transaction;
+                }
+            }
+        },
+    };
+    await handler.bootstrap();
+    return repository;
+}
+
+function genesisIssuance(block) {
+    const store = Object.create(Stores.StateStore.prototype);
+    if (typeof store.getGenesisIssuance !== "function") {
+        return { missing: true };
+    }
+    store.setGenesisBlock(block);
+    return { value: store.getGenesisIssuance() };
+}
+
+function verifyWalletsConsistency(wallets) {
+    const builder = Object.create(StateBuilder.prototype);
+    builder.logger = silentLogger;
+    builder.configRepository = { get: (_key, defaultValue) => defaultValue };
+    builder.walletRepository = { allByAddress: () => wallets };
+    builder.verifyWalletsConsistency();
+}
+
+const balanceOf = (repository, address) => repository.findByAddress(address).getBalance().toFixed();
+const sumOfBalances = (repository) =>
+    repository.allByAddress().reduce((sum, wallet) => sum.plus(wallet.getBalance()), BigNumber.ZERO);
+const expectEqual = (actual, expected) =>
+    String(actual) === String(expected) ? true : `got ${actual}, expected ${expected}`;
+
+async function main() {
+    console.log(`SOLAR_DIR=${SOLAR_DIR}`);
+    Managers.configManager.setConfig(makeConfig(stubGenesisJson()));
+    const generatorAddress = Identities.Address.fromPublicKey(GENERATOR_PUBLIC_KEY);
+
+    // Stub devnet genesis.
+    const genesisOnly = await bootstrapTransfers([genesisTransfer(), delegateRegistration()]);
+
+    await check("stub genesis: bootstrap leaves the generator at balance 0 (base: -10000000000000000)", () =>
+        expectEqual(balanceOf(genesisOnly, generatorAddress), "0"),
+    );
+    await check("stub genesis: recipient 1 is credited 5000000000000000", () =>
+        expectEqual(balanceOf(genesisOnly, RECIPIENT_1), "5000000000000000"),
+    );
+    await check("stub genesis: recipient 2 is credited 3000000000000000", () =>
+        expectEqual(balanceOf(genesisOnly, RECIPIENT_2), "3000000000000000"),
+    );
+    await check("stub genesis: recipient 3 is credited 2000000000000000", () =>
+        expectEqual(balanceOf(genesisOnly, RECIPIENT_3), "2000000000000000"),
+    );
+
+    await check(`stub genesis: getGenesisIssuance() is ${ISSUED}`, () => {
+        const result = genesisIssuance(stubGenesisBlock([genesisTransfer(), delegateRegistration()]));
+        return result.missing
+            ? "StateStore.getGenesisIssuance is missing"
+            : expectEqual(result.value.toFixed(), ISSUED);
+    });
+
+    await check("stub genesis: sum of balances after the genesis equals issued", () => {
+        const result = genesisIssuance(stubGenesisBlock([genesisTransfer()]));
+        if (result.missing) {
+            return `StateStore.getGenesisIssuance is missing; sum of balances is ${sumOfBalances(
+                genesisOnly,
+            ).toFixed()}`;
+        }
+        return expectEqual(sumOfBalances(genesisOnly).toFixed(), result.value.toFixed());
+    });
+
+    await check("stub genesis: no wallet is negative after the genesis", () => {
+        const negative = genesisOnly.allByAddress().filter((wallet) => wallet.getBalance().isLessThan(0));
+        return negative.length === 0
+            ? true
+            : negative.map((w) => `${w.getAddress()}=${w.getBalance().toFixed()}`).join(", ");
+    });
+
+    await check("stub genesis: verifyWalletsConsistency passes on the genesis state", () => {
+        verifyWalletsConsistency(genesisOnly.allByAddress());
+        return true;
+    });
+
+    // Nonces are still set for the genesis sender (StateBuilder.buildSentTransactions, unchanged).
+    await check("stub genesis: the generator's nonce is still set by buildSentTransactions", async () => {
+        const builder = Object.create(StateBuilder.prototype);
+        builder.walletRepository = genesisOnly;
+        builder.transactionRepository = {
+            getSentTransactions: async () => [{ senderId: generatorAddress, amount: "0", fee: "0", nonce: "1" }],
+        };
+        const before = balanceOf(genesisOnly, generatorAddress);
+        await builder.buildSentTransactions();
+        const wallet = genesisOnly.findByAddress(generatorAddress);
+        if (wallet.getNonce().toFixed() !== "1") {
+            return `nonce is ${wallet.getNonce().toFixed()}, expected 1`;
+        }
+        return expectEqual(wallet.getBalance().toFixed(), before);
+    });
+
+    // A later transfer from the generator key is debited normally.
+    const later = await bootstrapTransfers([
+        genesisTransfer(),
+        transferData({
+            senderPublicKey: OTHER_PUBLIC_KEY,
+            blockHeight: 2,
+            sequence: 0,
+            nonce: 1,
+            items: [[generatorAddress, "5000"]],
+        }),
+        transferData({
+            senderPublicKey: GENERATOR_PUBLIC_KEY,
+            blockHeight: 2,
+            sequence: 1,
+            nonce: 2,
+            items: [[RECIPIENT_3, "1000"]],
+        }),
+    ]);
+    await check("later transfer: the generator's balance changes by +5000 received and -1000 sent", () => {
+        const delta = later
+            .findByAddress(generatorAddress)
+            .getBalance()
+            .minus(genesisOnly.findByAddress(generatorAddress).getBalance());
+        return expectEqual(delta.toFixed(), "4000");
+    });
+    await check("later transfer: the generator ends at 4000 and recipient 3 at 2000000000001000", () => {
+        const generator = balanceOf(later, generatorAddress);
+        const recipient = balanceOf(later, RECIPIENT_3);
+        return generator === "4000" && recipient === "2000000000001000"
+            ? true
+            : `generator ${generator}, recipient 3 ${recipient}`;
+    });
+
+    // A height-1 transfer from any other key is not issuance.
+    const otherAtGenesis = transferData({
+        senderPublicKey: OTHER_PUBLIC_KEY,
+        blockHeight: 1,
+        sequence: 2,
+        nonce: 1,
+        items: [[RECIPIENT_2, "7"]],
+    });
+    const withOther = await bootstrapTransfers([genesisTransfer(), otherAtGenesis]);
+    await check("other sender at height 1: its transfer is debited (not issuance)", () =>
+        expectEqual(balanceOf(withOther, Identities.Address.fromPublicKey(OTHER_PUBLIC_KEY)), "-7"),
+    );
+    await check("other sender at height 1: getGenesisIssuance() counts only the generator's items", () => {
+        const result = genesisIssuance(stubGenesisBlock([genesisTransfer(), otherAtGenesis]));
+        return result.missing
+            ? "StateStore.getGenesisIssuance is missing"
+            : expectEqual(result.value.toFixed(), ISSUED);
+    });
+
+    // verifyWalletsConsistency: the genesis sender is no longer exempt.
+    await check("verifyWalletsConsistency throws for a negative genesis sender (base: exempt)", () => {
+        const wallet = new StubWallet(generatorAddress);
+        wallet.setBalance("-1");
+        try {
+            verifyWalletsConsistency([wallet]);
+        } catch (error) {
+            return /negative balance/.test(error.message) ? true : `unexpected error ${error.message}`;
+        }
+        return "no error thrown";
+    });
+    await check("verifyWalletsConsistency throws for any other negative wallet (unchanged)", () => {
+        const wallet = new StubWallet(RECIPIENT_2);
+        wallet.setBalance("-1");
+        try {
+            verifyWalletsConsistency([wallet]);
+        } catch (error) {
+            return /negative balance/.test(error.message) ? true : `unexpected error ${error.message}`;
+        }
+        return "no error thrown";
+    });
+
+    // The real devnet genesis, when present.
+    const realGenesisFile = path.join(DEVNET_CRYPTO, "genesisBlock.json");
+    if (!fs.existsSync(realGenesisFile)) {
+        console.log(`SKIP real genesis: ${realGenesisFile} does not exist`);
+    } else {
+        const genesisJson = JSON.parse(fs.readFileSync(realGenesisFile, "utf8"));
+        Managers.configManager.setConfig(makeConfig(JSON.parse(JSON.stringify(genesisJson))));
+        const block = Blocks.BlockFactory.fromJson(JSON.parse(JSON.stringify(genesisJson)));
+        const realGenerator = Identities.Address.fromPublicKey(block.data.generatorPublicKey);
+
+        const expectedCredit = new Map();
+        let expectedIssued = BigNumber.ZERO;
+        for (const { data } of block.transactions) {
+            if (data.typeGroup === 1 && data.type === 6 && data.senderPublicKey === block.data.generatorPublicKey) {
+                for (const item of data.asset.transfers) {
+                    expectedIssued = expectedIssued.plus(item.amount);
+                    const previous = expectedCredit.get(item.recipientId) || BigNumber.ZERO;
+                    expectedCredit.set(item.recipientId, previous.plus(item.amount));
+                }
+            }
+        }
+
+        const real = await bootstrapTransfers(block.transactions.map((transaction) => transaction.data));
+        await check(`real genesis (${block.data.id.slice(0, 16)}...): the generator is at balance 0`, () =>
+            expectEqual(balanceOf(real, realGenerator), "0"),
+        );
+        await check("real genesis: every recipient holds the sum of its issuance items", () => {
+            const wrong = [...expectedCredit].filter(
+                ([address, amount]) => balanceOf(real, address) !== amount.toFixed(),
+            );
+            return wrong.length === 0
+                ? true
+                : wrong.map(([a, v]) => `${a} has ${balanceOf(real, a)}, expected ${v.toFixed()}`).join("; ");
+        });
+        await check(`real genesis: getGenesisIssuance() is ${ISSUED} (the devnet allocation)`, () => {
+            const result = genesisIssuance(block);
+            if (result.missing) {
+                return "StateStore.getGenesisIssuance is missing";
+            }
+            return expectEqual(result.value.toFixed(), expectedIssued.toFixed()) === true
+                ? expectEqual(result.value.toFixed(), ISSUED)
+                : `got ${result.value.toFixed()}, the generator's items sum to ${expectedIssued.toFixed()}`;
+        });
+        await check("real genesis: sum of balances equals issued and verifyWalletsConsistency passes", () => {
+            verifyWalletsConsistency(real.allByAddress());
+            return expectEqual(sumOfBalances(real).toFixed(), expectedIssued.toFixed());
+        });
+    }
+
+    console.log(`40-genesis-issuance: ${passed} passed, ${failed} failed`);
+    process.exit(failed === 0 ? 0 : 1);
+}
+
+main().catch((error) => {
+    console.log(`FAIL test harness: ${error && error.stack}`);
+    process.exit(1);
+});

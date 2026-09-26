@@ -1,4 +1,4 @@
-import { Identities, Managers, Utils } from "@solar-network/crypto";
+import { Utils } from "@solar-network/crypto";
 import { Repositories } from "@solar-network/database";
 import { Application, Container, Contracts, Enums, Services, Utils as AppUtils } from "@solar-network/kernel";
 import { Handlers } from "@solar-network/transactions";
@@ -114,14 +114,11 @@ export class StateBuilder {
         const logNegativeBalance = (wallet, type, balance) =>
             this.logger.warning(`Wallet ${wallet.address} has a negative ${type} of ${balance}`);
 
-        const genesisAddress: string = Identities.Address.fromPublicKey(
-            Managers.configManager.get("genesisBlock.transactions")[0].senderPublicKey,
-        );
         for (const wallet of this.walletRepository.allByAddress()) {
             const address: string = wallet.getAddress();
             const balance: Utils.BigNumber = wallet.getBalance();
 
-            if (balance.isLessThan(0) && (address === undefined || address !== genesisAddress)) {
+            if (balance.isLessThan(0)) {
                 const negativeBalanceExceptions: Record<string, Record<string, string>> = this.configRepository.get(
                     "crypto.exceptions.negativeBalances",
                     {},

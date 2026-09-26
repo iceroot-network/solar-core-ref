@@ -1,4 +1,4 @@
-import { Interfaces } from "@solar-network/crypto";
+import { Interfaces, Utils } from "@solar-network/crypto";
 
 export interface BlockPing {
     count: number;
@@ -23,6 +23,11 @@ export interface StateStore {
      * @returns {void}
      */
     setGenesisBlock(block: Interfaces.IBlock): void;
+
+    /**
+     * Get the amount issued by the genesis block.
+     */
+    getGenesisIssuance(): Utils.BigNumber;
 
     getLastDownloadedBlock(): Interfaces.IBlockData | undefined;
 
