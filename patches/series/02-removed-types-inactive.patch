@@ -1,0 +1,301 @@
+From 98baa6cb8892c317c69ab0f0f6a0f54dc93119a9 Mon Sep 17 00:00:00 2001
+From: NayiemW <37852059+NayiemW@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 02:16:33 +0000
+Subject: [PATCH] Keep the removed transaction types inactive
+
+isActivated() now returns false for 1/0 legacy transfer, 1/3 legacy
+vote and the three HTLC types 1/8, 1/9 and 1/10, instead of reading the
+legacyTransfer, legacyVote and htlcEnabled milestone flags. The 2/2
+Solar vote is active whatever legacyVote says. 1/4 was already
+hard-coded off and is not touched. The handlers stay registered, so
+both pool admission and block application reject the removed types as
+deactivated.
+
+IceRoot removes these types, so no milestone flag may bring them back.
+Only a configuration that turns one of the flags on behaves differently
+from Solar 4.3.1.
+
+The Managers import is dropped from core/vote.ts and htlc-claim.ts,
+where isActivated() was its only use.
+
+Test: patches/tests/02-removed-types-inactive.test.js. With a milestone
+that turns all three flags on, it fails on the unpatched build and
+passes here.
+
+Patch: 02
+Consensus: config-dependent only
+---
+ .../src/handlers/core/htlc-claim.ts           |   4 +-
+ .../src/handlers/core/htlc-lock.ts            |   2 +-
+ .../src/handlers/core/htlc-refund.ts          |   2 +-
+ .../src/handlers/core/legacy-transfer.ts      |   2 +-
+ .../transactions/src/handlers/core/vote.ts    |   4 +-
+ .../transactions/src/handlers/solar/vote.ts   |   2 +-
+ .../tests/02-removed-types-inactive.test.js   | 165 ++++++++++++++++++
+ 7 files changed, 173 insertions(+), 8 deletions(-)
+ create mode 100644 patches/tests/02-removed-types-inactive.test.js
+
+diff --git a/packages/transactions/src/handlers/core/htlc-claim.ts b/packages/transactions/src/handlers/core/htlc-claim.ts
+index 9b0e0116e..32bae2192 100644
+--- a/packages/transactions/src/handlers/core/htlc-claim.ts
++++ b/packages/transactions/src/handlers/core/htlc-claim.ts
+@@ -1,4 +1,4 @@
+-import { Crypto, Enums, Interfaces, Managers, Transactions, Utils } from "@solar-network/crypto";
++import { Crypto, Enums, Interfaces, Transactions, Utils } from "@solar-network/crypto";
+ import { Container, Contracts, Utils as AppUtils } from "@solar-network/kernel";
+ import { strict } from "assert";
+ 
+@@ -53,7 +53,7 @@ export class HtlcClaimTransactionHandler extends TransactionHandler {
+     }
+ 
+     public async isActivated(): Promise<boolean> {
+-        return Managers.configManager.getMilestone().htlcEnabled;
++        return false;
+     }
+ 
+     public dynamicFee(context: Contracts.Shared.DynamicFeeContext): Utils.BigNumber {
+diff --git a/packages/transactions/src/handlers/core/htlc-lock.ts b/packages/transactions/src/handlers/core/htlc-lock.ts
+index 82593bf01..988527d7d 100644
+--- a/packages/transactions/src/handlers/core/htlc-lock.ts
++++ b/packages/transactions/src/handlers/core/htlc-lock.ts
+@@ -83,7 +83,7 @@ export class HtlcLockTransactionHandler extends TransactionHandler {
+     }
+ 
+     public async isActivated(): Promise<boolean> {
+-        return Managers.configManager.getMilestone().htlcEnabled;
++        return false;
+     }
+ 
+     public async throwIfCannotBeApplied(
+diff --git a/packages/transactions/src/handlers/core/htlc-refund.ts b/packages/transactions/src/handlers/core/htlc-refund.ts
+index d6b55495a..7a364fa47 100644
+--- a/packages/transactions/src/handlers/core/htlc-refund.ts
++++ b/packages/transactions/src/handlers/core/htlc-refund.ts
+@@ -59,7 +59,7 @@ export class HtlcRefundTransactionHandler extends TransactionHandler {
+     }
+ 
+     public async isActivated(): Promise<boolean> {
+-        return Managers.configManager.getMilestone().htlcEnabled;
++        return false;
+     }
+ 
+     public dynamicFee(context: Contracts.Shared.DynamicFeeContext): Utils.BigNumber {
+diff --git a/packages/transactions/src/handlers/core/legacy-transfer.ts b/packages/transactions/src/handlers/core/legacy-transfer.ts
+index b52d8627f..81d99ea96 100644
+--- a/packages/transactions/src/handlers/core/legacy-transfer.ts
++++ b/packages/transactions/src/handlers/core/legacy-transfer.ts
+@@ -50,7 +50,7 @@ export class LegacyTransferTransactionHandler extends TransactionHandler {
+     }
+ 
+     public async isActivated(): Promise<boolean> {
+-        return Managers.configManager.getMilestone().legacyTransfer;
++        return false;
+     }
+ 
+     public async throwIfCannotEnterPool(transaction: Interfaces.ITransaction): Promise<void> {
+diff --git a/packages/transactions/src/handlers/core/vote.ts b/packages/transactions/src/handlers/core/vote.ts
+index d12f2b11d..5b131a11f 100644
+--- a/packages/transactions/src/handlers/core/vote.ts
++++ b/packages/transactions/src/handlers/core/vote.ts
+@@ -1,4 +1,4 @@
+-import { Enums, Interfaces, Managers, Transactions } from "@solar-network/crypto";
++import { Enums, Interfaces, Transactions } from "@solar-network/crypto";
+ import { Container, Contracts, Enums as AppEnums, Utils } from "@solar-network/kernel";
+ 
+ import { AlreadyVotedError, NoVoteError, UnvoteMismatchError, VotedForNonDelegateError } from "../../errors";
+@@ -77,7 +77,7 @@ export class LegacyVoteTransactionHandler extends TransactionHandler {
+     }
+ 
+     public async isActivated(): Promise<boolean> {
+-        return Managers.configManager.getMilestone().legacyVote;
++        return false;
+     }
+ 
+     public async throwIfCannotBeApplied(
+diff --git a/packages/transactions/src/handlers/solar/vote.ts b/packages/transactions/src/handlers/solar/vote.ts
+index 38041bb71..2b78ec7c8 100644
+--- a/packages/transactions/src/handlers/solar/vote.ts
++++ b/packages/transactions/src/handlers/solar/vote.ts
+@@ -54,7 +54,7 @@ export class VoteTransactionHandler extends TransactionHandler {
+     }
+ 
+     public async isActivated(): Promise<boolean> {
+-        return !Managers.configManager.getMilestone().legacyVote;
++        return true;
+     }
+ 
+     public async throwIfCannotBeApplied(
+diff --git a/patches/tests/02-removed-types-inactive.test.js b/patches/tests/02-removed-types-inactive.test.js
+new file mode 100644
+index 000000000..edcfb2c66
+--- /dev/null
++++ b/patches/tests/02-removed-types-inactive.test.js
+@@ -0,0 +1,165 @@
++#!/usr/bin/env node
++// Patch 02 removed-types-inactive.
++// The removed types 1/0, 1/3, 1/4 and 1/8 to 1/10 are inactive whatever the milestone says,
++// and the Solar vote 2/2 is active whatever legacyVote says. The check uses a height-1
++// milestone that turns legacyTransfer, legacyVote and htlcEnabled on, which in Solar 4.3.1
++// activates the removed types and deactivates 2/2.
++//
++// Usage: SOLAR_DIR=<built Solar checkout> node patches/tests/02-removed-types-inactive.test.js
++// Exit code 0 when every check passes, 1 otherwise.
++"use strict";
++
++const path = require("path");
++
++const SOLAR_DIR = process.env.SOLAR_DIR || path.resolve(__dirname, "../..");
++
++let failed = 0;
++let passed = 0;
++const pass = (name) => {
++    passed++;
++    console.log(`PASS ${name}`);
++};
++const fail = (name, detail) => {
++    failed++;
++    console.log(`FAIL ${name}: ${detail}`);
++};
++const check = async (name, fn) => {
++    try {
++        const detail = await fn();
++        if (detail === true) {
++            pass(name);
++        } else {
++            fail(name, detail);
++        }
++    } catch (error) {
++        fail(
++            name,
++            `threw ${error && error.constructor ? error.constructor.name : typeof error}: ${error && error.message}`,
++        );
++    }
++};
++
++const devnetConfig = (flags) => ({
++    network: {
++        name: "devnet",
++        messagePrefix: "Solar devnet message:\n",
++        addressCharacter: "d",
++        bip32: { public: 70617039, private: 70615956 },
++        pubKeyHash: 90,
++        nethash: "c9b03ab996ef3ac216a2ac53eaee71118cbf7995fa44449a7fb7f94bbe18bcca",
++        wif: 252,
++        slip44: 1,
++        client: { token: "dROOT", symbol: "dRT", explorer: "" },
++    },
++    milestones: [
++        {
++            height: 1,
++            activeDelegates: 53,
++            blockTime: 8,
++            block: { version: 0, maxTransactions: 150, maxPayload: 2097152 },
++            blocksToRevokeDelegateResignation: 106,
++            epoch: "2026-09-25T20:05:04.000Z",
++            reward: 0,
++            burn: { feeBasisPoints: 9000, txAmount: 2000000 },
++            donations: {},
++            acceptLegacySchnorrTransactions: false,
++            bip340: true,
++            ...flags,
++        },
++    ],
++    genesisBlock: { transactions: [] },
++    exceptions: {},
++});
++
++const main = async () => {
++    let Crypto;
++    let Transactions;
++    try {
++        Crypto = require(path.join(SOLAR_DIR, "packages/crypto/dist"));
++        Transactions = require(path.join(SOLAR_DIR, "packages/transactions/dist"));
++    } catch (error) {
++        fail("load Solar packages", error.message);
++        return;
++    }
++
++    const { Core, Solar, Registry } = Transactions.Handlers;
++    const removed = [
++        ["1/0 legacy transfer", 1, 0, Core.LegacyTransferTransactionHandler],
++        ["1/3 legacy vote", 1, 3, Core.LegacyVoteTransactionHandler],
++        ["1/4 multisignature registration", 1, 4, Core.MultiSignatureRegistrationTransactionHandler],
++        ["1/8 HTLC lock", 1, 8, Core.HtlcLockTransactionHandler],
++        ["1/9 HTLC claim", 1, 9, Core.HtlcClaimTransactionHandler],
++        ["1/10 HTLC refund", 1, 10, Core.HtlcRefundTransactionHandler],
++    ];
++
++    const registry = Object.create(Registry.prototype);
++    registry.provider = { isRegistrationRequired: () => false, registerHandlers: () => {} };
++    registry.handlers = [
++        ...removed.map(([, , , HandlerClass]) => Object.create(HandlerClass.prototype)),
++        Object.create(Solar.VoteTransactionHandler.prototype),
++    ];
++
++    // Scenario A: the milestone turns every legacy flag on.
++    Crypto.Managers.configManager.setConfig(
++        devnetConfig({ legacyTransfer: true, legacyVote: true, htlcEnabled: true }),
++    );
++    Crypto.Managers.configManager.setHeight(1);
++
++    await check("milestone under test has legacyTransfer, legacyVote and htlcEnabled true", () => {
++        const milestone = Crypto.Managers.configManager.getMilestone(1);
++        return milestone.legacyTransfer === true && milestone.legacyVote === true && milestone.htlcEnabled === true
++            ? true
++            : JSON.stringify(milestone);
++    });
++
++    for (const [label, typeGroup, type, HandlerClass] of removed) {
++        await check(`flags on: ${label} isActivated() is false`, async () => {
++            const active = await Object.create(HandlerClass.prototype).isActivated();
++            return active === false ? true : `isActivated() returned ${active}`;
++        });
++        await check(`flags on: ${label} is rejected as deactivated by the registry`, async () => {
++            try {
++                await registry.getActivatedHandlerForData({ typeGroup, type });
++            } catch (error) {
++                if (!(error instanceof Transactions.Errors.DeactivatedTransactionHandlerError)) {
++                    return `wrong error class ${error.constructor.name}: ${error.message}`;
++                }
++                return error.message === `Transaction type Core/${type} is deactivated`
++                    ? true
++                    : `wrong message: ${error.message}`;
++            }
++            return "resolved an active handler";
++        });
++    }
++
++    await check("flags on: 2/2 Solar vote isActivated() is true", async () => {
++        const active = await Object.create(Solar.VoteTransactionHandler.prototype).isActivated();
++        return active === true ? true : `isActivated() returned ${active}`;
++    });
++    await check("flags on: 2/2 Solar vote resolves in the registry", async () => {
++        const handler = await registry.getActivatedHandlerForData({ typeGroup: 2, type: 2 });
++        return handler instanceof Solar.VoteTransactionHandler ? true : `resolved ${handler.constructor.name}`;
++    });
++
++    // Scenario B: a devnet milestone with the flags off and no htlcEnabled key.
++    Crypto.Managers.configManager.setConfig(devnetConfig({ legacyTransfer: false, legacyVote: false }));
++    Crypto.Managers.configManager.setHeight(1);
++
++    for (const [label, , , HandlerClass] of removed) {
++        await check(`flags off: ${label} is not active`, async () => {
++            const active = await Object.create(HandlerClass.prototype).isActivated();
++            return !active ? true : `isActivated() returned ${active}`;
++        });
++    }
++    await check("flags off: 2/2 Solar vote is active", async () => {
++        const active = await Object.create(Solar.VoteTransactionHandler.prototype).isActivated();
++        return active === true ? true : `isActivated() returned ${active}`;
++    });
++};
++
++main()
++    .catch((error) => fail("test script", error && error.stack))
++    .finally(() => {
++        console.log(`${failed === 0 ? "OK" : "FAILED"}: ${passed} passed, ${failed} failed (SOLAR_DIR=${SOLAR_DIR})`);
++        process.exit(failed === 0 ? 0 : 1);
++    });
+-- 
+2.43.0
+

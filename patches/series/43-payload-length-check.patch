@@ -1,0 +1,239 @@
+From 97543ca10ef6662312030c03f56e0aa8ca386b00 Mon Sep 17 00:00:00 2001
+From: NayiemW <37852059+NayiemW@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 02:25:36 +0000
+Subject: [PATCH] Require a payloadLength of 32 bytes per transaction
+
+A block is valid only if payloadLength = 32 x numberOfTransactions, the
+value that Solar's forger writes and a generated devnet genesis
+carries. Block.verify() adds the error "Invalid payload length"
+otherwise. The rule reads the header's numberOfTransactions, so it
+judges a header on its own count. Solar read payloadLength and never
+checked it.
+
+Test: patches/tests/43-payload-length-check.test.js. Blocks with 0 and
+2 transactions verify at payloadLength 0 and 64. The 2-transaction
+block fails at 63, 65 and 0, and the empty block at 32 (base: all
+verify). A generated IceRoot devnet genesis (107 transactions, 3424)
+still verifies.
+
+Solar's own mainnet and testnet preset genesis blocks (payloadLength
+15496 and 15494 for 107 transactions) do not meet the rule. Nothing
+verifies the configured genesis at node start, and those networks are
+offline for good.
+
+Patch: 43
+Consensus: yes
+---
+ packages/crypto/src/blocks/block.ts           |   5 +
+ patches/tests/43-payload-length-check.test.js | 183 ++++++++++++++++++
+ 2 files changed, 188 insertions(+)
+ create mode 100644 patches/tests/43-payload-length-check.test.js
+
+diff --git a/packages/crypto/src/blocks/block.ts b/packages/crypto/src/blocks/block.ts
+index 93f9d6e71..cbac102a8 100644
+--- a/packages/crypto/src/blocks/block.ts
++++ b/packages/crypto/src/blocks/block.ts
+@@ -200,6 +200,11 @@ export class Block implements IBlock {
+                 result.errors.push("Invalid number of transactions");
+             }
+ 
++            // The payload is the 32-byte ids of the transactions the header counts.
++            if (block.payloadLength !== 32 * block.numberOfTransactions) {
++                result.errors.push("Invalid payload length");
++            }
++
+             if (this.transactions.length > constants.block.maxTransactions) {
+                 if (block.height > 1) {
+                     result.errors.push("Transactions length is too high");
+diff --git a/patches/tests/43-payload-length-check.test.js b/patches/tests/43-payload-length-check.test.js
+new file mode 100644
+index 000000000..0d8dd5fab
+--- /dev/null
++++ b/patches/tests/43-payload-length-check.test.js
+@@ -0,0 +1,183 @@
++#!/usr/bin/env node
++// Patch 43 payload-length-check.
++//
++// A block is valid only if payloadLength = 32 x numberOfTransactions (the value that Solar's forger
++// writes and a generated devnet genesis carries). Block.verify() reports "Invalid payload length"
++// otherwise. The rule reads the header's numberOfTransactions, so it holds for a header on its own too.
++//
++// Usage: SOLAR_DIR=<built Solar checkout> node 43-payload-length-check.test.js
++// DEVNET_CRYPTO may point at a directory with a real genesisBlock.json (an IceRoot devnet: 107 transactions,
++// payloadLength 3424); when the file exists the test checks that it still verifies.
++"use strict";
++
++const fs = require("fs");
++const path = require("path");
++
++const SOLAR_DIR = path.resolve(process.env.SOLAR_DIR || path.join(__dirname, "..", ".."));
++const DEVNET_CRYPTO = process.env.DEVNET_CRYPTO || path.join(__dirname, "devnet-crypto");
++
++const load = (pkg) => require(path.join(SOLAR_DIR, "packages", pkg, "dist"));
++const { Blocks, Crypto, Identities, Managers, Transactions, Utils } = load("crypto");
++const { BigNumber } = Utils;
++
++let passed = 0;
++let failed = 0;
++
++function check(name, fn) {
++    try {
++        const outcome = fn();
++        if (outcome === true) {
++            passed++;
++            console.log(`PASS ${name}`);
++        } else {
++            failed++;
++            console.log(`FAIL ${name}: ${outcome}`);
++        }
++    } catch (error) {
++        failed++;
++        console.log(`FAIL ${name}: threw ${error && error.message}`);
++    }
++}
++
++// Network configuration template (see patches/README.md).
++function makeConfig(genesisBlock) {
++    return {
++        network: {
++            name: "devnet",
++            messagePrefix: "Solar devnet message:\n",
++            addressCharacter: "d",
++            bip32: { public: 70617039, private: 70615956 },
++            pubKeyHash: 90,
++            nethash: "c9b03ab996ef3ac216a2ac53eaee71118cbf7995fa44449a7fb7f94bbe18bcca",
++            wif: 252,
++            slip44: 1,
++            client: { token: "dROOT", symbol: "dRT", explorer: "" },
++        },
++        milestones: [
++            {
++                height: 1,
++                activeDelegates: 53,
++                block: { version: 0, maxTransactions: 150, maxPayload: 2097152 },
++                blocksToRevokeDelegateResignation: 106,
++                blockTime: 8,
++                burn: { feeBasisPoints: 9000, txAmount: 2000000 },
++                epoch: "2026-01-01T00:00:00.000Z",
++                legacyTransfer: false,
++                legacyVote: false,
++                transfer: { maximum: 256, minimum: 1 },
++                reward: 0,
++                acceptLegacySchnorrTransactions: false,
++                bip340: true,
++                donations: {},
++            },
++        ],
++        genesisBlock,
++        exceptions: {},
++    };
++}
++
++const FORGER = Identities.Keys.fromPassphrase("patch 43 forger");
++const AUX = Buffer.alloc(32, 7);
++const PREVIOUS_BLOCK = "fbdd5afb435e34729406ebc7d385727237bf386440799270536c39b9ee45605e";
++const RECIPIENT = "dZ1W1GsDCSyhR148oMhuHy3PkhnnSGCqVn";
++
++const transfer = (nonce) =>
++    Transactions.BuilderFactory.transfer()
++        .addTransfer(RECIPIENT, "1000")
++        .nonce(String(nonce))
++        .fee("10000000")
++        .sign("patch 43 sender")
++        .build();
++
++// The block header data the forger builds (forger/src/delegate.ts), with an explicit payloadLength.
++function blockData(transactions, payloadLength) {
++    const data = transactions.map((transaction) => transaction.data);
++    return {
++        version: 0,
++        timestamp: 1000,
++        height: 2,
++        previousBlock: PREVIOUS_BLOCK,
++        numberOfTransactions: data.length,
++        totalAmount: data.reduce((sum, tx) => sum.plus(tx.amount || BigNumber.ZERO), BigNumber.ZERO),
++        totalFee: data.reduce((sum, tx) => sum.plus(tx.fee), BigNumber.ZERO),
++        reward: BigNumber.ZERO,
++        payloadLength,
++        payloadHash: Crypto.HashAlgorithms.sha256(data.map((tx) => Buffer.from(tx.id, "hex"))).toString("hex"),
++        transactions: data,
++    };
++}
++
++const make = (transactions, payloadLength) =>
++    Blocks.BlockFactory.make(blockData(transactions, payloadLength), FORGER, AUX);
++
++const expectVerified = (block) =>
++    block.verification.verified ? true : `errors: ${JSON.stringify(block.verification.errors)}`;
++const expectOnly = (block, message) => {
++    const errors = block.verification.errors.map(String);
++    if (block.verification.verified) {
++        return "verified";
++    }
++    return errors.length === 1 && errors[0] === message ? true : `errors: ${JSON.stringify(errors)}`;
++};
++
++console.log(`SOLAR_DIR=${SOLAR_DIR}`);
++
++// The configured genesis block is read once and cached by Solar (isGenesisTransaction), so the real
++// genesis, when present, is configured before any block is built.
++const realGenesisFile = path.join(DEVNET_CRYPTO, "genesisBlock.json");
++const genesisJson = fs.existsSync(realGenesisFile) ? JSON.parse(fs.readFileSync(realGenesisFile, "utf8")) : undefined;
++Managers.configManager.setConfig(
++    makeConfig(genesisJson ? JSON.parse(JSON.stringify(genesisJson)) : { transactions: [] }),
++);
++
++const two = [transfer(1), transfer(2)];
++
++check("0 transactions, payloadLength 0: verifies", () => expectVerified(make([], 0)));
++check("2 transactions, payloadLength 64: verifies", () => expectVerified(make(two, 64)));
++for (const length of [63, 65, 0]) {
++    check(`2 transactions, payloadLength ${length}: fails with "Invalid payload length" (base: verifies)`, () =>
++        expectOnly(make(two, length), "Invalid payload length"),
++    );
++}
++check('0 transactions, payloadLength 32: fails with "Invalid payload length" (base: verifies)', () =>
++    expectOnly(make([], 32), "Invalid payload length"),
++);
++
++// The rule reads the header's numberOfTransactions: a header that claims 2 transactions, with none
++// attached, is judged on its own count.
++function headerOnly(payloadLength) {
++    const data = blockData(two, payloadLength);
++    delete data.transactions;
++    data.generatorPublicKey = FORGER.publicKey.secp256k1;
++    const hash = Crypto.HashAlgorithms.sha256(Blocks.Serialiser.serialise(data, false));
++    data.blockSignature = Crypto.Hash.signSchnorrBip340(hash, FORGER, AUX);
++    data.id = Blocks.Block.getId(data);
++    return new Blocks.Block({ data, transactions: [] });
++}
++check("header claiming 2 transactions, payloadLength 64, none attached: no payload length error", () => {
++    const errors = headerOnly(64).verification.errors.map(String);
++    return !errors.includes("Invalid payload length") && errors.includes("Invalid number of transactions")
++        ? true
++        : `errors: ${JSON.stringify(errors)}`;
++});
++check('header claiming 2 transactions, payloadLength 0: also "Invalid payload length" (base: absent)', () => {
++    const errors = headerOnly(0).verification.errors.map(String);
++    return errors.includes("Invalid payload length") ? true : `errors: ${JSON.stringify(errors)}`;
++});
++
++if (!genesisJson) {
++    console.log(`SKIP real genesis: ${realGenesisFile} does not exist`);
++} else {
++    check(
++        `real genesis: ${genesisJson.numberOfTransactions} transactions, payloadLength ${genesisJson.payloadLength}, still verifies`,
++        () => {
++            const genesis = Blocks.BlockFactory.fromJson(JSON.parse(JSON.stringify(genesisJson)));
++            return genesis.data.payloadLength === 32 * genesis.data.numberOfTransactions
++                ? expectVerified(genesis)
++                : `payloadLength ${genesis.data.payloadLength} is not 32 x ${genesis.data.numberOfTransactions}`;
++        },
++    );
++}
++
++console.log(`43-payload-length-check: ${passed} passed, ${failed} failed`);
++process.exit(failed === 0 ? 0 : 1);
+-- 
+2.43.0
+
