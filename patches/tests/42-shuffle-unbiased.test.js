@@ -47,6 +47,33 @@ const GOLDEN = {
     // the rejection the order would be 1,10,12,26,2,9,50,24,... instead.
     1054879:
         "17,7,10,1,12,14,35,11,8,40,26,20,3,28,18,16,4,43,5,27,31,48,29,15,39,34,42,32,49,44,41,38,45,24,13,46,50,33,37,51,21,2,25,47,30,9,0,36,19,52,6,22,23",
+    // Rejection-path rounds added in s1-ref-v2. Each was computed from the rule alone,
+    // not from Solar code. For n = 53 about one round in
+    // 6.75 million rejects a draw. Counting from round 1, these are the 2nd, 3rd and 9th such rounds
+    // (round 1,054,879 above is the 1st).
+    // Round 1,125,219: the second rejection round. For i = 44 (bound 45), stream bytes 32-35 (the
+    // first word of the second block) give r = 4294967279 >= 2^32 - (2^32 mod 45) = 4294967265.
+    // Without the rejection the order would be 49,29,1,8,3,46,35,31,... instead.
+    1125219:
+        "4,40,38,13,21,49,15,1,26,28,37,7,31,47,39,34,33,27,43,20,42,17,51,41,45,2,29,32,5,46,12,23,18,48,0,8,16,50,3,24,25,35,11,6,19,36,52,14,44,9,10,22,30",
+    // Round 6,447,578: the rejected draw lies deepest in the stream. For i = 23 (bound 24), stream
+    // bytes 116-119 (the fourth block) give r = 4294967284 >= 2^32 - (2^32 mod 24) = 4294967280.
+    // Without the rejection the order would be 11,0,35,41,7,40,33,23,... instead.
+    6447578:
+        "41,35,23,40,19,8,43,0,32,9,51,52,33,7,25,44,11,45,17,14,28,22,4,34,3,50,15,26,48,36,13,30,39,10,18,47,37,24,49,1,38,12,6,31,27,42,2,46,5,29,21,16,20",
+    // Round 57,852,255: the rejected word is 2^32 - 1. For i = 32 (bound 33), stream bytes 80-83
+    // (the third block) give r = 4294967295 >= 2^32 - (2^32 mod 33) = 4294967292.
+    // Without the rejection the order would be 0,51,32,50,31,21,23,17,... instead.
+    57852255:
+        "1,13,47,14,6,45,50,46,29,44,31,42,20,52,48,23,0,21,4,32,22,17,51,33,7,2,12,28,19,43,30,5,34,35,11,26,16,8,40,37,39,9,3,38,18,15,24,41,25,49,36,27,10",
+};
+
+// The golden rounds above in which a draw is rejected, with the draw that is rejected.
+const REJECTED_DRAW = {
+    1054879: "i = 51, bound 52",
+    1125219: "i = 44, bound 45",
+    6447578: "i = 23, bound 24",
+    57852255: "i = 32, bound 33",
 };
 
 const STATS_ROUNDS = 200000;
@@ -111,7 +138,8 @@ function summary(probabilities) {
 console.log(`SOLAR_DIR=${SOLAR_DIR}`);
 
 for (const round of Object.keys(GOLDEN)) {
-    check(`round ${round}, 53 delegates: golden order`, () => {
+    const rejection = REJECTED_DRAW[round] ? ` (rejection path: ${REJECTED_DRAW[round]})` : "";
+    check(`round ${round}, 53 delegates: golden order${rejection}`, () => {
         const got = order(Number(round), 53);
         return got === GOLDEN[round] ? true : `got ${got}`;
     });
