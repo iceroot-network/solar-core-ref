@@ -349,6 +349,18 @@ export class RoundState implements Contracts.State.RoundState {
             }
         }
 
+        // As setDelegatesRound does at a round start, delegate.round marks this round's delegates and no other
+        const roundDelegates: Set<string> = new Set(
+            prevRoundState.getRoundDelegates().map((delegate) => delegate.getAttribute("delegate.username")),
+        );
+        for (const delegateWallet of this.walletRepository.allByUsername()) {
+            if (roundDelegates.has(delegateWallet.getAttribute("delegate.username"))) {
+                delegateWallet.setAttribute("delegate.round", roundInfo.round);
+            } else if (delegateWallet.hasAttribute("delegate.round")) {
+                delegateWallet.forgetAttribute("delegate.round");
+            }
+        }
+
         // ! return readonly array instead of taking slice
         return prevRoundState.getRoundDelegates().slice();
     }

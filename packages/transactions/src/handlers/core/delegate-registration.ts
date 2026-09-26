@@ -193,7 +193,6 @@ export class DelegateRegistrationTransactionHandler extends TransactionHandler {
             forgedRewards: Utils.BigNumber.ZERO,
             donations: Utils.BigNumber.ZERO,
             producedBlocks: 0,
-            round: 0,
             voters: 0,
         });
 
