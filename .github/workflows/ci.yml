@@ -1,4 +1,4 @@
-name: Reference repository metadata checks
+name: Reference repository production checks
 
 on:
   push:
@@ -49,3 +49,28 @@ jobs:
           python3 -c 'import json; p=json.load(open("package.json")); assert p["private"] is True; assert p["name"] == "core"'
       # This is the compatibility reference, not an IceRoot node release.
       # Do not run upstream schedules, install legacy dependencies, or publish packages here.
+
+  codeql:
+    name: Analyze reference JavaScript and TypeScript
+    needs: production-merge
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Initialize CodeQL without building the reference
+        uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4
+        with:
+          languages: javascript-typescript
+          build-mode: none
+      - name: Analyze and upload security findings
+        uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4
+        with:
+          category: /language:javascript-typescript
+      # Keep GitHub's settings-level default setup disabled: it also creates
+      # PR/scheduled runs. This guarded job preserves scanning only on prod merges.
+      # No dependency installation, legacy node build, or package publication.
