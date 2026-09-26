@@ -1,4 +1,5 @@
 import { TransactionType, TransactionTypeGroup } from "../../../enums";
+import { VoteAssetTooLargeError } from "../../../errors";
 import { BigNumber } from "../../../utils/big-number";
 import { ByteBuffer } from "../../../utils/byte-buffer";
 import * as schemas from "../schemas";
@@ -21,6 +22,14 @@ export class VoteTransaction extends Transaction {
         const buff: ByteBuffer = new ByteBuffer(Buffer.alloc(1024));
 
         if (data.asset && data.asset.votes) {
+            let size: number = 1;
+            for (const vote of Object.keys(data.asset.votes)) {
+                size += 3 + Buffer.byteLength(vote);
+            }
+            if (size > 1024) {
+                throw new VoteAssetTooLargeError(size);
+            }
+
             buff.writeUInt8(Object.keys(data.asset.votes).length);
             for (const [vote, percent] of Object.entries(data.asset.votes)) {
                 buff.writeUInt8(vote.length);
@@ -34,6 +43,7 @@ export class VoteTransaction extends Transaction {
 
     public deserialise(buf: ByteBuffer): void {
         const { data } = this;
+        const start: number = buf.getOffset();
         const numberOfVotes: number = buf.readUInt8();
         data.asset = { votes: {} };
 
@@ -44,6 +54,11 @@ export class VoteTransaction extends Transaction {
             if (data.asset && data.asset.votes) {
                 data.asset.votes[vote] = percent;
             }
+        }
+
+        const size: number = buf.getOffset() - start;
+        if (size > 1024) {
+            throw new VoteAssetTooLargeError(size);
         }
     }
 }
