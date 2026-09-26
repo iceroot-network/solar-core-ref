@@ -81,7 +81,8 @@ const configure = (milestones) =>
 
 configure([
     heightOne(),
-    { height: 100, dynamicReward: { ranks: ranks(51) } },
+    // The shrink comes with activeDelegates 51 at a round start, so the table still covers every active rank (patch 26)
+    { height: 107, activeDelegates: 51, dynamicReward: { ranks: ranks(51) } },
     {
         height: 200,
         donations: { [ADDRESS_A]: { basisPoints: 500, purpose: "purpose-a" } },
@@ -92,7 +93,7 @@ configure([
 
 const cm = Managers.configManager;
 
-check("ranks shrink from 53 to 51 keys at height 100", () => {
+check("ranks shrink from 53 to 51 keys at height 107", () => {
     const count = Object.keys(cm.getMilestone(150).dynamicReward.ranks).length;
     return count === 51 || `getMilestone(150).dynamicReward.ranks has ${count} keys, expected 51`;
 });

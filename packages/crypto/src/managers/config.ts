@@ -264,7 +264,54 @@ export class ConfigManager {
                     fail(`donations add up to ${sum} basis points, over 10000`);
                 }
             }
+
+            // An enabled rank table pays every active rank, so a missing or bad reward cannot halt the chain
+            const dynamicReward = milestone.dynamicReward;
+            if (dynamicReward && dynamicReward.enabled) {
+                const activeDelegates = milestone.activeDelegates;
+                if (!Number.isSafeInteger(activeDelegates) || activeDelegates < 1) {
+                    fail("activeDelegates must be a positive integer when dynamicReward is enabled");
+                }
+
+                const ranks = dynamicReward.ranks;
+                if (typeof ranks !== "object" || ranks === null || Array.isArray(ranks)) {
+                    fail(
+                        `dynamicReward.ranks must be an object with a reward for every rank from 1 to ${activeDelegates}`,
+                    );
+                }
+                for (let rank = 1; rank <= activeDelegates; rank++) {
+                    if (!Object.prototype.hasOwnProperty.call(ranks, rank)) {
+                        fail(
+                            `dynamicReward.ranks has no reward for rank ${rank} (activeDelegates is ${activeDelegates})`,
+                        );
+                    }
+                    if (!this.isRewardAmount(ranks[rank])) {
+                        fail(
+                            `dynamicReward.ranks.${rank}, the reward for rank ${rank}, must be a non-negative safe integer or a decimal integer string of at most 18446744073709551615`,
+                        );
+                    }
+                }
+
+                if (!this.isRewardAmount(dynamicReward.secondaryReward)) {
+                    fail(
+                        "dynamicReward.secondaryReward must be a non-negative safe integer or a decimal integer string of at most 18446744073709551615",
+                    );
+                }
+            }
         }
+    }
+
+    // A block reward in base units: a non-negative safe integer, or a canonical decimal string that fits the u64 reward field
+    private isRewardAmount(value: unknown): boolean {
+        if (typeof value === "number") {
+            return Number.isSafeInteger(value) && value >= 0;
+        }
+
+        return (
+            typeof value === "string" &&
+            /^(0|[1-9][0-9]*)$/.test(value) &&
+            BigInt(value) <= BigInt("18446744073709551615")
+        );
     }
 
     private isNetworkAddress(address: string): boolean {
