@@ -270,18 +270,34 @@ export class RoundState implements Contracts.State.RoundState {
         roundInfo: Contracts.Shared.RoundInfo,
         delegates: Contracts.State.Wallet[],
     ): Contracts.State.Wallet[] {
+        // Unbiased Fisher-Yates (Durstenfeld) shuffle (L-97 (1)). The byte stream is the seed, then
+        // SHA-256 of the previous 32-byte block; each draw reads a u32 (little-endian) and rejects the
+        // values that would make `r % bound` biased.
         const seedSource: string = roundInfo.round.toString();
         let currentSeed: Buffer = Crypto.HashAlgorithms.sha256(seedSource);
+        let offset: number = 0;
+
+        const draw = (bound: number): number => {
+            const limit: number = 0x100000000 - (0x100000000 % bound);
+            for (;;) {
+                if (offset === currentSeed.length) {
+                    currentSeed = Crypto.HashAlgorithms.sha256(currentSeed);
+                    offset = 0;
+                }
+                const value: number = currentSeed.readUInt32LE(offset);
+                offset += 4;
+                if (value < limit) {
+                    return value % bound;
+                }
+            }
+        };
 
         delegates = delegates.map((delegate) => delegate.clone());
-        for (let i = 0, delCount = delegates.length; i < delCount; i++) {
-            for (let x = 0; x < 4 && i < delCount; i++, x++) {
-                const newIndex = currentSeed[x] % delCount;
-                const b = delegates[newIndex];
-                delegates[newIndex] = delegates[i];
-                delegates[i] = b;
-            }
-            currentSeed = Crypto.HashAlgorithms.sha256(currentSeed);
+        for (let i = delegates.length - 1; i > 0; i--) {
+            const j: number = draw(i + 1);
+            const b = delegates[i];
+            delegates[i] = delegates[j];
+            delegates[j] = b;
         }
 
         return delegates;
